@@ -141,7 +141,7 @@ def plot_structure(points, quads, linkages, ax):
         y = points[quad, 1]
         ax.fill(x, y, color=(1, 229/255, 204/255),edgecolor='k', linewidth=2, alpha = 0.8)
 
-    ax.axis('off');
+    ax.axis('off')
     ax.set_aspect('equal')
     
 
