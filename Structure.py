@@ -899,6 +899,13 @@ class GenericStructure:
         return dual_boundary_angles
 
     def get_dual_boundary_node_inds(self, bound_ind):
+        """
+        Get node indices along the outer boundary of the structure.
+        Args:
+            bound_ind (int): Boundary index (0: left, 1: bottom, 2: right, 3: top)
+            Returns:
+            list: Node indices along the outer boundary in counter-clockwise order
+        """
 
         linkage_inds = self.get_outer_boundary_linkages(bound_ind)
         boundary_node_inds = []

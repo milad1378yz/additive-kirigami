@@ -3,3 +3,5 @@ __pycache__/
 *.png
 *.pdf
 .vscode/
+demo.py
+temp.py
