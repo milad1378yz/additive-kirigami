@@ -5,3 +5,4 @@ __pycache__/
 .vscode/
 demo.py
 temp.py
+demo_*.py
