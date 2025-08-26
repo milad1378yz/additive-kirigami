@@ -6,17 +6,18 @@ from tqdm import trange
 from Structure import MatrixStructure
 
 from Utils import plot_structure
+from copy import deepcopy
 
 # ----------------------------
 # Config (edit to taste)
 # ----------------------------
-GRID_ROWS = 10  # number of linkage rows  (height)
-GRID_COLS = 10  # number of linkage cols  (width)
+GRID_ROWS = 12  # number of linkage rows  (height)
+GRID_COLS = 12  # number of linkage cols  (width)
 IMG_H, IMG_W = 256, 256  # output image resolution
 N_TRAIN = 5000  # how many training samples to generate
 N_VALID = 1000  # how many validation samples to generate
-N_TRAIN = 50  # how many training samples to generate
-N_VALID = 20  # how many validation samples to generate
+N_TRAIN = 10000  # how many training samples to generate
+N_VALID = 500  # how many validation samples to generate
 OUTPUT_PKL = "kirigami_dataset.pkl"
 RANDOM_SEED = 42  # set to None for non-deterministic
 
@@ -117,7 +118,11 @@ def _make_one_sample(grid_rows, grid_cols, img_h, img_w, rng):
     boundary_points, corners = _compute_boundary_points_and_corners(structure)
 
     # 3) random interior offsets ~ (-0.9, 9) using your original distribution
-    interior_offsets = np.power(10.0, rng.random((grid_rows, grid_cols)) * 2.0 - 1.0) - 1.0
+    interior_offsets = (
+        np.power(10.0, rng.random((grid_rows, grid_cols)) * 2.0 - 1.0) - 1.0
+    )  # TODO: SOBOL Sampling
+    # make a deep copy of this
+    # interior_offsets_copy = deepcopy(interior_offsets)
 
     # 4) zero boundary offsets
     boundary_offsets = [[0.0] * grid_rows, [0.0] * grid_cols, [0.0] * grid_rows, [0.0] * grid_cols]
@@ -163,7 +168,7 @@ def _make_one_sample(grid_rows, grid_cols, img_h, img_w, rng):
     # _, axs = plt.subplots(1, 1, figsize=(5, 5))
     # plot_structure(points_0, structure.quads, ax=axs, linkages=None)
     # plt.savefig(f"sample_full.png")
-    # plt.close(fig)
+    # plt.close()
 
     # 9) metadata
     metadata = {

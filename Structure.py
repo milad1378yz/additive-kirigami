@@ -1019,7 +1019,7 @@ class MatrixStructure(GenericStructure):
         assert offsets.shape[1] == num_linkage_cols
 
         # design_matrix = np.zeros(self.design_matrix_dims(), dtype=np.float128)
-        design_matrix = np.zeros(self.design_matrix_dims(), dtype=float)
+        design_matrix = np.zeros(self.design_matrix_dims(), dtype=np.float64)
 
         # SEED
         for j in range(num_linkage_cols):
@@ -1215,9 +1215,16 @@ class MatrixStructure(GenericStructure):
             bound_inds.extend(bound_nodes)
 
         sub_design_matrix = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
-        sub_design_matrix_inverse = np.linalg.inv(sub_design_matrix)
 
+        if np.abs(np.linalg.det(sub_design_matrix)) <= 1e-6:
+            print("This Matrix is not invertible")
+        # print("Det:", np.linalg.det(sub_design_matrix))
+        sub_design_matrix_inverse = np.linalg.inv(sub_design_matrix)
         inverted_seed_points = np.dot(sub_design_matrix_inverse, boundary_points)
+
+        # inverted_seed_points = np.linalg.solve(sub_design_matrix, boundary_points)
+
+        # inverted_seed_points, *_ = np.linalg.lstsq(sub_design_matrix, boundary_points, rcond=None)
         top_points = inverted_seed_points[:num_linkage_cols, :]
         left_points = inverted_seed_points[
             num_linkage_cols : num_linkage_cols + num_linkage_rows, :
@@ -1332,7 +1339,7 @@ class DeployedMatrixStructure(GenericStructure):
                     else:
                         boundary_phis[bound_ind][z] = phi
 
-        design_matrix = np.zeros(self.design_matrix_dims(), dtype=float)
+        design_matrix = np.zeros(self.design_matrix_dims(), dtype=np.float64)
 
         # SEED
         for j in range(num_linkage_cols):
