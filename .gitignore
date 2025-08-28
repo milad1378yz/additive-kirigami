@@ -6,3 +6,5 @@ __pycache__/
 demo.py
 temp.py
 demo_*.py
+
+*.pkl

@@ -3,10 +3,23 @@ import pickle
 from matplotlib.path import Path
 from tqdm import trange
 
+from tqdm import tqdm
+
 from Structure import MatrixStructure
 
 from Utils import plot_structure
 from copy import deepcopy
+
+
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from scipy.stats import qmc as _qmc
+
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
 
 # ----------------------------
 # Config (edit to taste)
@@ -20,6 +33,13 @@ N_TRAIN = 10000  # how many training samples to generate
 N_VALID = 500  # how many validation samples to generate
 OUTPUT_PKL = "kirigami_dataset.pkl"
 RANDOM_SEED = 42  # set to None for non-deterministic
+
+# sampling / epsilon-range hyperparameters
+USE_SOBOL = True  # do sobol sampling to cover better the space
+EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
+EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
+EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
+NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
 
 
 # ----------------------------
@@ -46,6 +66,50 @@ def _compute_boundary_points_and_corners(structure: MatrixStructure):
         boundary_points.append(np.vstack(local_boundary_points))
     corners = np.vstack(corners)
     return boundary_points, corners
+
+
+# Map uniform [0,1] -> epsilon in desired range (linear or log10 like your original)
+def _map_u_to_eps(
+    u01: np.ndarray, eps_min: float, eps_max: float, scale: str = "log"
+) -> np.ndarray:
+    """
+    u01: ndarray in [0,1] (any shape)
+    returns eps with same shape in [eps_min, eps_max] using the chosen scaling.
+    """
+    if scale == "log":
+        # preserves your shape: eps = 10^(a + (b-a)*u) - 1
+        lo = eps_min + 1.0
+        hi = eps_max + 1.0
+        if lo <= 0.0 or hi <= 0.0:
+            raise ValueError("For EPS_SCALE='log', require EPS_MIN > -1 so that (eps+1) > 0.")
+        a = np.log10(lo)
+        b = np.log10(hi)
+        return np.power(10.0, a + (b - a) * u01) - 1.0
+    else:
+        # linear
+        return eps_min + (eps_max - eps_min) * u01
+
+
+# Sobol (quasi-random) block generator; falls back to uniform if SciPy missing or disabled
+def _make_u_batches(
+    n_samples: int, grid_rows: int, grid_cols: int, seed=None, use_sobol=True
+) -> np.ndarray:
+    """
+    Returns an array of shape (n_samples, grid_rows, grid_cols) with values in [0,1].
+    """
+    dim = grid_rows * grid_cols
+    if use_sobol and _HAVE_SCIPY:
+        # Scrambled Sobol for better space-filling; reproducible via seed
+        sampler = _qmc.Sobol(d=dim, scramble=True, seed=seed)
+        # We don't enforce power-of-two; .random(n) continues the sequence fine
+        u = sampler.random(n_samples)  # shape: (n_samples, dim)
+        u = u.reshape(n_samples, grid_rows, grid_cols)
+        return u
+    else:
+        if use_sobol and not _HAVE_SCIPY:
+            print("[WARN] SciPy not found; falling back to standard uniform sampling.")
+        rng = np.random.default_rng(seed)
+        return rng.random((n_samples, grid_rows, grid_cols))
 
 
 # NEW: silhouette rasterizer (φ = 0), fills the union of all quads (no cuts)
@@ -102,7 +166,18 @@ def _rasterize_quads_filled(points, quads, out_h=256, out_w=256):
     return mask
 
 
-def _make_one_sample(grid_rows, grid_cols, img_h, img_w, rng):
+def _make_one_sample(
+    grid_rows,
+    grid_cols,
+    img_h,
+    img_w,
+    rng,
+    # optional quasi-random block & eps config
+    u_interior=None,
+    eps_min=None,
+    eps_max=None,
+    eps_scale="log",
+):
     """
     Build one kirigami sample and return:
         {
@@ -118,9 +193,16 @@ def _make_one_sample(grid_rows, grid_cols, img_h, img_w, rng):
     boundary_points, corners = _compute_boundary_points_and_corners(structure)
 
     # 3) random interior offsets ~ (-0.9, 9) using your original distribution
-    interior_offsets = (
-        np.power(10.0, rng.random((grid_rows, grid_cols)) * 2.0 - 1.0) - 1.0
-    )  # TODO: SOBOL Sampling
+    if u_interior is None:
+        # fallback to your original random (kept)
+        interior_u = rng.random((grid_rows, grid_cols))
+        interior_offsets = np.power(10.0, interior_u * 2.0 - 1.0) - 1.0
+    else:
+        emn = EPS_MIN if eps_min is None else eps_min
+        emx = EPS_MAX if eps_max is None else eps_max
+        esc = EPS_SCALE if eps_scale is None else eps_scale
+        interior_offsets = _map_u_to_eps(u_interior, emn, emx, esc)
+
     # make a deep copy of this
     # interior_offsets_copy = deepcopy(interior_offsets)
 
@@ -183,15 +265,74 @@ def _make_one_sample(grid_rows, grid_cols, img_h, img_w, rng):
     return {"image": image, "metadata": metadata, "mask": mask}
 
 
-def build_dataset(n_train, n_valid, grid_rows, grid_cols, img_h, img_w, seed=None):
+def build_dataset(
+    n_train,
+    n_valid,
+    grid_rows,
+    grid_cols,
+    img_h,
+    img_w,
+    seed=None,
+    # Pass-through knobs for eps mapping and sobol
+    eps_min=EPS_MIN,
+    eps_max=EPS_MAX,
+    eps_scale=EPS_SCALE,
+    use_sobol=USE_SOBOL,
+    num_workers=NUM_WORKERS,
+):
     rng = np.random.default_rng(seed)
     ds = {"train": [], "valid": []}
 
-    for _ in trange(n_train, desc="Generating train samples"):
-        ds["train"].append(_make_one_sample(grid_rows, grid_cols, img_h, img_w, rng))
+    # Precompute quasi-random blocks for reproducibility & threading
+    u_train = _make_u_batches(n_train, grid_rows, grid_cols, seed=seed, use_sobol=use_sobol)
+    u_valid = _make_u_batches(
+        n_valid, grid_rows, grid_cols, seed=None if seed is None else seed + 1, use_sobol=use_sobol
+    )
 
-    for _ in trange(n_valid, desc="Generating valid samples"):
-        ds["valid"].append(_make_one_sample(grid_rows, grid_cols, img_h, img_w, rng))
+    # Threaded generation for train
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        # use tqdm for progress (keeps your original feel)
+        for sample in tqdm(
+            ex.map(
+                lambda u: _make_one_sample(
+                    grid_rows,
+                    grid_cols,
+                    img_h,
+                    img_w,
+                    None,
+                    u_interior=u,
+                    eps_min=eps_min,
+                    eps_max=eps_max,
+                    eps_scale=eps_scale,
+                ),
+                u_train,
+            ),
+            total=n_train,
+            desc="Generating train samples (threads)",
+        ):
+            ds["train"].append(sample)
+
+    # Threaded generation for valid
+    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+        for sample in tqdm(
+            ex.map(
+                lambda u: _make_one_sample(
+                    grid_rows,
+                    grid_cols,
+                    img_h,
+                    img_w,
+                    None,
+                    u_interior=u,
+                    eps_min=eps_min,
+                    eps_max=eps_max,
+                    eps_scale=eps_scale,
+                ),
+                u_valid,
+            ),
+            total=n_valid,
+            desc="Generating valid samples (threads)",
+        ):
+            ds["valid"].append(sample)
 
     return ds
 
@@ -208,6 +349,12 @@ if __name__ == "__main__":
         img_h=IMG_H,
         img_w=IMG_W,
         seed=RANDOM_SEED,
+        # Expose epsilon-range and Sobol/threading knobs here as well
+        eps_min=EPS_MIN,
+        eps_max=EPS_MAX,
+        eps_scale=EPS_SCALE,
+        use_sobol=USE_SOBOL,
+        num_workers=NUM_WORKERS,
     )
 
     with open(OUTPUT_PKL, "wb") as f:
