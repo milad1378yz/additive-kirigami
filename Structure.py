@@ -1,5 +1,12 @@
 from Utils import *
 
+# Numerical stability knobs for inverse design solvers
+# If the boundary system condition number exceeds this, raise an error.
+MAX_INVERSE_CONDITION_NUMBER = 1e20
+# If the system is ill-conditioned but below MAX, use mild Tikhonov regularization.
+REGULARIZE_COND_THRESHOLD = 1e12
+RIDGE_LAMBDA = 1e-8
+
 
 class GenericStructure:
     """
@@ -1216,15 +1223,29 @@ class MatrixStructure(GenericStructure):
 
         sub_design_matrix = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
 
-        if np.abs(np.linalg.det(sub_design_matrix)) <= 1e-6:
-            print("This Matrix is not invertible")
-        # print("Det:", np.linalg.det(sub_design_matrix))
-        sub_design_matrix_inverse = np.linalg.inv(sub_design_matrix)
-        inverted_seed_points = np.dot(sub_design_matrix_inverse, boundary_points)
+        # Solve boundary system robustly and raise on extreme ill-conditioning
+        A = sub_design_matrix
+        B = boundary_points
+        try:
+            cond = np.linalg.cond(A)
+        except Exception:
+            cond = np.inf
 
-        # inverted_seed_points = np.linalg.solve(sub_design_matrix, boundary_points)
+        if not np.isfinite(cond) or cond > MAX_INVERSE_CONDITION_NUMBER:
+            raise ValueError(
+                f"Inverse design boundary system ill-conditioned (cond={cond:.2e}) "
+                f"for grid {num_linkage_rows}x{num_linkage_cols}."
+            )
 
-        # inverted_seed_points, *_ = np.linalg.lstsq(sub_design_matrix, boundary_points, rcond=None)
+        try:
+            if cond < REGULARIZE_COND_THRESHOLD:
+                inverted_seed_points = np.linalg.solve(A, B)
+            else:
+                AtA = A.T @ A
+                AtB = A.T @ B
+                inverted_seed_points = np.linalg.solve(AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), AtB)
+        except np.linalg.LinAlgError:
+            inverted_seed_points, *_ = np.linalg.lstsq(A, B, rcond=None)
         top_points = inverted_seed_points[:num_linkage_cols, :]
         left_points = inverted_seed_points[
             num_linkage_cols : num_linkage_cols + num_linkage_rows, :
@@ -1590,9 +1611,30 @@ class DeployedMatrixStructure(GenericStructure):
                 bound_inds.append(2 * ind + 1)
 
         sub_design_matrix = design_matrix[bound_inds, : 2 * (num_linkage_cols + num_linkage_rows)]
-        sub_design_matrix_inverse = np.linalg.inv(sub_design_matrix)
 
-        inverted_seed_points = np.dot(sub_design_matrix_inverse, boundary_points.flatten("C"))
+        # Robust solve with conditioning check; raise on extreme ill-conditioning
+        A = sub_design_matrix
+        b = boundary_points.flatten("C")
+        try:
+            cond = np.linalg.cond(A)
+        except Exception:
+            cond = np.inf
+
+        if not np.isfinite(cond) or cond > MAX_INVERSE_CONDITION_NUMBER:
+            raise ValueError(
+                f"Inverse design boundary system (deployed) ill-conditioned (cond={cond:.2e}) "
+                f"for grid {num_linkage_rows}x{num_linkage_cols}."
+            )
+
+        try:
+            if cond < REGULARIZE_COND_THRESHOLD:
+                inverted_seed_points = np.linalg.solve(A, b)
+            else:
+                AtA = A.T @ A
+                Atb = A.T @ b
+                inverted_seed_points = np.linalg.solve(AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), Atb)
+        except np.linalg.LinAlgError:
+            inverted_seed_points, *_ = np.linalg.lstsq(A, b, rcond=None)
         top_points = inverted_seed_points[: 2 * num_linkage_cols].reshape(num_linkage_cols, 2)
         left_points = inverted_seed_points[
             2 * num_linkage_cols : 2 * (num_linkage_cols + num_linkage_rows)
