@@ -36,8 +36,8 @@ RANDOM_SEED = 42  # set to None for non-deterministic
 
 # sampling / epsilon-range hyperparameters
 USE_SOBOL = True  # do sobol sampling to cover better the space
-EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
-EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
+EPS_MIN = -0.6  # range of the epsilons should be in my hand (hyperparameters)
+EPS_MAX = 2.0  # (matches your original ~(-0.9, 9))
 EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
 NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
 
