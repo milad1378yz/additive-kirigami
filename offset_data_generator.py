@@ -1,13 +1,11 @@
 import numpy as np
 import pickle
 from matplotlib.path import Path
-from tqdm import trange
-
 from tqdm import tqdm
 
 from Structure import MatrixStructure
 
-from Utils import plot_structure
+from Utils import plot_structure, find_invalid_quads
 from copy import deepcopy
 
 
@@ -193,15 +191,17 @@ def _make_one_sample(
     boundary_points, corners = _compute_boundary_points_and_corners(structure)
 
     # 3) random interior offsets ~ (-0.9, 9) using your original distribution
+    emn = EPS_MIN if eps_min is None else eps_min
+    emx = EPS_MAX if eps_max is None else eps_max
+    esc = EPS_SCALE if eps_scale is None else eps_scale
+
     if u_interior is None:
-        # fallback to your original random (kept)
+        if rng is None:
+            rng = np.random.default_rng()
         interior_u = rng.random((grid_rows, grid_cols))
-        interior_offsets = np.power(10.0, interior_u * 2.0 - 1.0) - 1.0
     else:
-        emn = EPS_MIN if eps_min is None else eps_min
-        emx = EPS_MAX if eps_max is None else eps_max
-        esc = EPS_SCALE if eps_scale is None else eps_scale
-        interior_offsets = _map_u_to_eps(u_interior, emn, emx, esc)
+        interior_u = u_interior
+    interior_offsets = _map_u_to_eps(interior_u, emn, emx, esc)
 
     # make a deep copy of this
     # interior_offsets_copy = deepcopy(interior_offsets)
@@ -225,6 +225,15 @@ def _make_one_sample(
     # recentre both (kept from your original; rasterizer still normalizes to bbox)
     points_0[:, 0] = points_0[:, 0] - (np.max(points_0[:, 0]) + np.min(points_0[:, 0])) / 2
     points_0[:, 1] = points_0[:, 1] - (np.max(points_0[:, 1]) + np.min(points_0[:, 1])) / 2
+
+    invalid_quads = find_invalid_quads(points_0, structure.quads)
+    if invalid_quads:
+        issues = ", ".join(sorted({reason for _, reason in invalid_quads}))
+        print(
+            f"[warn] Discarding sample with {len(invalid_quads)} invalid quads -> {issues}",
+            flush=True,
+        )
+        return None
 
     # 7) rasterize (unchanged image) + NEW silhouette mask
     silhouette_mask = _rasterize_quads_filled(
@@ -290,6 +299,7 @@ def build_dataset(
     )
 
     # Threaded generation for train
+    skipped_train = 0
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         # use tqdm for progress (keeps your original feel)
         for sample in tqdm(
@@ -310,9 +320,37 @@ def build_dataset(
             total=n_train,
             desc="Generating train samples (threads)",
         ):
+            if sample is None:
+                skipped_train += 1
+                continue
             ds["train"].append(sample)
 
+    if skipped_train:
+        print(f"[info] Skipped {skipped_train} invalid train samples; refilling to target.")
+
+    if len(ds["train"]) < n_train:
+        refill_rng = np.random.default_rng(None if seed is None else seed + 12345)
+        remaining = n_train - len(ds["train"])
+        with tqdm(total=remaining, desc="Refilling train samples") as refill_bar:
+            while len(ds["train"]) < n_train:
+                sample = _make_one_sample(
+                    grid_rows,
+                    grid_cols,
+                    img_h,
+                    img_w,
+                    refill_rng,
+                    None,
+                    eps_min=eps_min,
+                    eps_max=eps_max,
+                    eps_scale=eps_scale,
+                )
+                if sample is None:
+                    continue
+                ds["train"].append(sample)
+                refill_bar.update(1)
+
     # Threaded generation for valid
+    skipped_valid = 0
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
         for sample in tqdm(
             ex.map(
@@ -332,7 +370,34 @@ def build_dataset(
             total=n_valid,
             desc="Generating valid samples (threads)",
         ):
+            if sample is None:
+                skipped_valid += 1
+                continue
             ds["valid"].append(sample)
+
+    if skipped_valid:
+        print(f"[info] Skipped {skipped_valid} invalid valid samples; refilling to target.")
+
+    if len(ds["valid"]) < n_valid:
+        refill_rng = np.random.default_rng(None if seed is None else seed + 54321)
+        remaining = n_valid - len(ds["valid"])
+        with tqdm(total=remaining, desc="Refilling valid samples") as refill_bar:
+            while len(ds["valid"]) < n_valid:
+                sample = _make_one_sample(
+                    grid_rows,
+                    grid_cols,
+                    img_h,
+                    img_w,
+                    refill_rng,
+                    None,
+                    eps_min=eps_min,
+                    eps_max=eps_max,
+                    eps_scale=eps_scale,
+                )
+                if sample is None:
+                    continue
+                ds["valid"].append(sample)
+                refill_bar.update(1)
 
     return ds
 

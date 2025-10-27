@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from Structure import MatrixStructure
-from Utils import plot_structure
+from Utils import plot_structure, find_invalid_quads
 from offset_data_generator import (
     _compute_boundary_points_and_corners,
     _rasterize_quads_filled,
@@ -80,6 +80,7 @@ def show_samples(
     for i in range(n_samples):
         structure, pts, mask = generate_shape_and_mask(grid_rows, grid_cols, img_h, img_w, rng)
         extent = mask_extent_for_points(pts, img_h, img_w)
+        invalid_quads = find_invalid_quads(pts, structure.quads)
 
         if show_raw_mask:
             axM, ax0, ax1 = axes[i, 0], axes[i, 1], axes[i, 2]
@@ -94,10 +95,11 @@ def show_samples(
 
         # Middle/Left: shape only
         plot_structure(pts, structure.quads, linkages=None, ax=ax0)
-        ax0.set_title("Shape")
+        ax0.set_title("Shape" + (" (invalid)" if invalid_quads else ""))
 
         # Right: shape + transparent mask overlay with darkening outside mask
         plot_structure(pts, structure.quads, linkages=None, ax=ax1)
+        ax1.set_title("Shape + Mask Overlay" + (" (invalid)" if invalid_quads else ""))
 
         # Darken non-mask area so non-mask shows as 0 (dark)
         dark = np.zeros((img_h, img_w, 4), dtype=np.float32)
@@ -110,11 +112,14 @@ def show_samples(
         overlay[..., 1] = 1.0  # green tint
         overlay[..., 3] = mask * alpha  # alpha from mask
         ax1.imshow(overlay, extent=extent, origin="upper", zorder=6)
-        ax1.set_title("Shape + Mask Overlay")
+        if invalid_quads:
+            issues = ", ".join(sorted({reason for _, reason in invalid_quads}))
+            print(f"[warn] Sample {i}: {len(invalid_quads)} invalid quads detected -> {issues}")
 
     plt.tight_layout()
     plt.savefig("shape_and_mask_samples.png", dpi=300)
 
 
-# Example usage (run in a notebook cell or as a script)
-show_samples(n_samples=8, grid_rows=14, grid_cols=14, img_h=256, img_w=256, alpha=0.4, seed=1)
+if __name__ == "__main__":
+    # Example usage (generates a gallery for manual inspection)
+    show_samples(n_samples=8, grid_rows=14, grid_cols=14, img_h=256, img_w=256, alpha=0.4, seed=1)

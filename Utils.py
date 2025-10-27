@@ -497,6 +497,77 @@ def deployment_linkage2matrix(i, j, num_linkage_rows, num_linkage_cols):
     return matrix_row_ind, label
 
 
+def _orientation2d(a, b, c):
+    """Return z-component of the 2D cross product for orientation tests."""
+    return np.cross(b - a, c - a)
+
+
+def _point_on_segment(a, b, c, tol=1e-9):
+    """Check whether point b lies on segment [a, c], with tolerance."""
+    return (
+        min(a[0], c[0]) - tol <= b[0] <= max(a[0], c[0]) + tol
+        and min(a[1], c[1]) - tol <= b[1] <= max(a[1], c[1]) + tol
+    )
+
+
+def _segments_intersect2d(p0, p1, p2, p3, tol=1e-9):
+    """Return True if segments [p0, p1] and [p2, p3] intersect."""
+    o1 = _orientation2d(p0, p1, p2)
+    o2 = _orientation2d(p0, p1, p3)
+    o3 = _orientation2d(p2, p3, p0)
+    o4 = _orientation2d(p2, p3, p1)
+
+    if abs(o1) <= tol and _point_on_segment(p0, p2, p1, tol):
+        return True
+    if abs(o2) <= tol and _point_on_segment(p0, p3, p1, tol):
+        return True
+    if abs(o3) <= tol and _point_on_segment(p2, p0, p3, tol):
+        return True
+    if abs(o4) <= tol and _point_on_segment(p2, p1, p3, tol):
+        return True
+
+    return (o1 * o2 < -tol**2) and (o3 * o4 < -tol**2)
+
+
+def find_invalid_quads(points, quads, area_tol=1e-8, tol=1e-9):
+    """
+    Identify quads that collapse or self-intersect.
+
+    Args:
+        points (ndarray): Vertex coordinates, shape (n, 2)
+        quads (ndarray): Quad indices, shape (m, 4)
+        area_tol (float): Minimum absolute area before flagging as collapsed
+        tol (float): Tolerance for intersection tests
+
+    Returns:
+        list[tuple[int, str]]: (quad_index, reason) for each invalid quad.
+    """
+    invalid = []
+    for idx, quad in enumerate(quads):
+        poly = points[np.asarray(quad)]
+        if not np.all(np.isfinite(poly)):
+            invalid.append((idx, "non-finite coordinates"))
+            continue
+
+        area = 0.5 * sum(
+            poly[i, 0] * poly[(i + 1) % 4, 1] - poly[(i + 1) % 4, 0] * poly[i, 1]
+            for i in range(4)
+        )
+        if abs(area) <= area_tol:
+            invalid.append((idx, "collapsed area"))
+            continue
+
+        if _segments_intersect2d(poly[0], poly[1], poly[2], poly[3], tol):
+            invalid.append((idx, "self-intersection (01×23)"))
+            continue
+
+        if _segments_intersect2d(poly[1], poly[2], poly[3], poly[0], tol):
+            invalid.append((idx, "self-intersection (12×30)"))
+            continue
+
+    return invalid
+
+
 def write_obj(filename, points, quads):
     """
     Write geometry data to Wavefront OBJ file format.
