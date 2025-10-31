@@ -499,9 +499,12 @@ class GenericStructure:
     @staticmethod
     def align_linkage_best_fit(layout_points, linkage_points, linkage_quads, quads):
         """
-        Align linkage_points to the current layout using a 2D best-fit rigid transform
-        (rotation + translation) computed over all shared nodes that have already
-        been placed in layout_points.
+        Align linkage_points to the current layout using an exact rigid transform
+        built from the two most separated already-placed correspondences.
+
+        Rationale: exact two-point alignment guarantees that the critical shared
+        edge(s) are matched perfectly while being much more stable than
+        accumulating many small least-squares errors over large grids.
 
         If only one shared node is available, performs a pure translation to match it.
         """
@@ -533,18 +536,37 @@ class GenericStructure:
             t = dst[0] - src[0]
             return linkage_points + t
 
-        # Kabsch/SVD best-fit rigid transform in 2D
-        c_src = src.mean(axis=0)
-        c_dst = dst.mean(axis=0)
-        A = src - c_src
-        B = dst - c_dst
-        H = A.T @ B
-        U, S, Vt = np.linalg.svd(H)
-        R = Vt.T @ U.T
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        t = c_dst - R @ c_src
+        # Choose the farthest pair of correspondences in the destination set
+        # for numerical stability and to cover multiple neighbors when possible.
+        num = len(dst)
+        best_i, best_j = 0, 1
+        best_d = -1.0
+        for i in range(num):
+            for j in range(i + 1, num):
+                d = float(np.linalg.norm(dst[j] - dst[i]))
+                if d > best_d:
+                    best_d = d
+                    best_i, best_j = i, j
+
+        a1, a2 = src[best_i], src[best_j]
+        b1, b2 = dst[best_i], dst[best_j]
+
+        # Build exact 2D rotation from vector alignment
+        v = a2 - a1
+        w = b2 - b1
+        nv = np.linalg.norm(v)
+        nw = np.linalg.norm(w)
+        if nv < 1e-12 or nw < 1e-12:
+            # Degenerate pair; fall back to translation to b1
+            t = b1 - a1
+            return linkage_points + t
+
+        v /= nv
+        w /= nw
+        c = float(np.dot(v, w))
+        s = float(v[0] * w[1] - v[1] * w[0])
+        R = np.array([[c, -s], [s, c]], dtype=float)
+        t = b1 - R @ a1
         return (R @ linkage_points.T).T + t
 
     @staticmethod
@@ -1006,6 +1028,27 @@ class GenericStructure:
         return affine_matrices
 
 
+    # --- Geometry clean‑up helpers ---
+    def _fix_quad_winding(self):
+        """
+        Reorder vertices of each quad so they are CCW around the quad centroid
+        in the current reference geometry (self.points). This prevents
+        self-intersections that stem from inconsistent vertex ordering in
+        extremely large grids.
+        """
+        if self.points is None:
+            return
+        pts = self.points
+        quads = self.quads
+        for i in range(len(quads)):
+            q = quads[i]
+            poly = pts[q]
+            c = poly.mean(axis=0)
+            ang = np.arctan2(poly[:, 1] - c[1], poly[:, 0] - c[0])
+            order = np.argsort(ang)
+            self.quads[i] = q[order]
+
+
 # ------------------------------------------------------- MATRIX -------------------------------------------------------
 
 
@@ -1235,6 +1278,8 @@ class MatrixStructure(GenericStructure):
         """
         design_matrix = self.calculate_design_matrix(offsets, boundary_offsets)
         self.points = np.dot(design_matrix, np.vstack((top_points, left_points, corners)))
+        # Normalize quad winding with the flat geometry
+        self._fix_quad_winding()
 
     def linear_inverse_design(self, boundary_points, corners, interior_offsets, boundary_offsets):
         """
