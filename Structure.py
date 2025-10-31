@@ -1196,19 +1196,11 @@ class MatrixStructure(GenericStructure):
         Updates:
             self.points: Structure geometry achieving target boundary
 
-        Process:
-            1. Extract boundary rows from design matrix
-            2. Form linear system: boundary_matrix @ seed_points = boundary_points
-            3. Solve for top and left seed points via matrix inverse
-            4. Build full structure with computed seed points
-
-        Mathematical approach:
-            - Reduces to linear system solving
-            - Guarantees exact boundary matching (if feasible)
-            - Enables target-driven design workflow
-
-        Shape transitions:
-            - Target boundary -> Computed seed points -> Full structure
+        Robust solver strategy (minimal I/O changes):
+            1) Build boundary system A @ X = B (with X = seed points)
+            2) Column-scale A and solve via truncated SVD (TSVD) for numerical rank
+            3) If needed, fall back to ridge-regularized normal equations
+            4) Final fallback: np.linalg.lstsq (SVD-based)
         """
 
         num_linkage_cols = self.num_linkage_cols
@@ -1216,41 +1208,99 @@ class MatrixStructure(GenericStructure):
 
         design_matrix = self.calculate_design_matrix(interior_offsets, boundary_offsets)
 
+        # Gather boundary row indices
         bound_inds = []
         for bound_ind in range(4):
             bound_nodes = self.get_outer_boundary_node_inds(bound_ind)
             bound_inds.extend(bound_nodes)
 
-        sub_design_matrix = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
-
-        # Solve boundary system robustly and raise on extreme ill-conditioning
-        A = sub_design_matrix
+        # Subsystem: rows = boundary nodes; cols = top+left seed points
+        A = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
         B = boundary_points
+        MAX_COND = 1e10
+        REG_COND = 1e6
+        BASE_RIDGE = 1e-6
+
+        REL_SVD_TOL = 1e-12  # relative truncation threshold for SVD
+        ABS_SVD_FLOOR = 1e-15  # absolute floor to prevent divide-by-zero
+        RIDGE_SCHEDULE = [BASE_RIDGE, 10 * BASE_RIDGE, 100 * BASE_RIDGE, 1e-3, 1e-2]
+
+        # Try to estimate conditioning (may fail for rank-deficient A via cond())
         try:
-            cond = np.linalg.cond(A)
+            cond_est = np.linalg.cond(A)
         except Exception:
-            cond = np.inf
+            cond_est = np.inf
 
-        if not np.isfinite(cond) or cond > MAX_INVERSE_CONDITION_NUMBER:
-            raise ValueError(
-                f"Inverse design boundary system ill-conditioned (cond={cond:.2e}) "
-                f"for grid {num_linkage_rows}x{num_linkage_cols}."
-            )
+        # ---------- Preferred path: scaled TSVD solve ----------
+        def solve_tsvd(A, B):
+            # Column scaling improves SVD behavior on badly scaled problems
+            col_norms = np.linalg.norm(A, axis=0)
+            col_norms[col_norms == 0.0] = 1.0
+            As = A / col_norms
 
+            # Economy SVD
+            U, s, Vt = np.linalg.svd(As, full_matrices=False)
+            s_max = s[0] if s.size else 0.0
+
+            # Determine numerical rank (relative + absolute guard)
+            svd_tol = max(REL_SVD_TOL * s_max, ABS_SVD_FLOOR)
+            keep = s > svd_tol
+            r = int(np.count_nonzero(keep))
+
+            if r == 0:
+                # Completely degenerate after truncation
+                raise np.linalg.LinAlgError("TSVD found zero numerical rank.")
+
+            # Truncated SVD solve: X = V * diag(1/s) * U^T * B (only kept comps)
+            UtB = U[:, :r].T @ B  # (r, m) @ (m, d) -> (r, d)
+            Xs = Vt[:r, :].T @ (UtB / s[:r][:, None])  # (n, r) @ (r, d) -> (n, d)
+
+            # Undo column scaling
+            X = Xs / col_norms[:, None]
+
+            # Heuristic condition check using kept singulars
+            approx_cond = (s[0] / s[r - 1]) if r > 1 else 1.0
+            return X, r, approx_cond
+
+        # Attempt TSVD first if A is not obviously well-conditioned
         try:
-            if cond < REGULARIZE_COND_THRESHOLD:
-                inverted_seed_points = np.linalg.solve(A, B)
+            X, r_used, approx_cond = solve_tsvd(A, B)
+            # If the raw cond was OK, or truncated cond is acceptable, accept TSVD solution
+            if np.isfinite(cond_est) and cond_est < REG_COND:
+                pass  # TSVD is fine (usually close to direct solve but safer)
             else:
-                AtA = A.T @ A
-                AtB = A.T @ B
-                inverted_seed_points = np.linalg.solve(AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), AtB)
-        except np.linalg.LinAlgError:
-            inverted_seed_points, *_ = np.linalg.lstsq(A, B, rcond=None)
-        top_points = inverted_seed_points[:num_linkage_cols, :]
-        left_points = inverted_seed_points[
-            num_linkage_cols : num_linkage_cols + num_linkage_rows, :
-        ]
+                if approx_cond > MAX_COND:
+                    # Too ill-conditioned even after truncation -> try ridge next
+                    raise np.linalg.LinAlgError("Truncated SVD still ill-conditioned.")
+        except Exception:
+            X = None
 
+        # ---------- Ridge-regularized normal equations fallback ----------
+        if X is None:
+            At = A.T
+            AtA = At @ A
+            AtB = At @ B
+            # Try a small schedule of lambda values (continuation)
+            solved = False
+            for lam in RIDGE_SCHEDULE:
+                try:
+                    X = np.linalg.solve(AtA + lam * np.eye(AtA.shape[0]), AtB)
+                    solved = True
+                    break
+                except np.linalg.LinAlgError:
+                    continue
+            if not solved:
+                X = None
+
+        # ---------- Final fallback: lstsq (SVD-based) ----------
+        if X is None:
+            X, *_ = np.linalg.lstsq(A, B, rcond=None)
+
+        # Split solution into top/left blocks (same as your original)
+        top_points = X[:num_linkage_cols, :]
+        left_points = X[num_linkage_cols : num_linkage_cols + num_linkage_rows, :]
+
+        # Build final structure
         self.build_structure(top_points, left_points, corners, interior_offsets, boundary_offsets)
 
 
@@ -1632,7 +1682,9 @@ class DeployedMatrixStructure(GenericStructure):
             else:
                 AtA = A.T @ A
                 Atb = A.T @ b
-                inverted_seed_points = np.linalg.solve(AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), Atb)
+                inverted_seed_points = np.linalg.solve(
+                    AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), Atb
+                )
         except np.linalg.LinAlgError:
             inverted_seed_points, *_ = np.linalg.lstsq(A, b, rcond=None)
         top_points = inverted_seed_points[: 2 * num_linkage_cols].reshape(num_linkage_cols, 2)

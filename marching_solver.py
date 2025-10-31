@@ -22,9 +22,6 @@ def checkerboard_phi(m, n, phi):
     return np.where(ij % 2 == 0, phi, np.pi - phi)
 
 
- 
-
-
 # March the whole m×n array, *one negative space at a time* (forward DP)
 def march_array(m, n, phi_field, eps_field, top_seeds, left_seeds):
     """
@@ -176,10 +173,6 @@ def lift_boundary_aligned(nodes, phi_field, corners, *, eps_b=0.0, project_to_ed
     return dict(top=b_top, right=b_right, bottom=b_bottom, left=b_left)
 
 
-# ---------- boundary lift via ghost four-bar (Supplement §1.4) ----------
- 
-
-
 # ---------- tiny driver: inverse-to-rectangle via marching ----------
 def inverse_rectangle(
     m=4,
@@ -200,14 +193,14 @@ def inverse_rectangle(
     top_seeds, left_seeds, corners = seeds_from_rectangle(TL, TR, BL, m, n)
 
     # march interior
-    nodes = march_array(m, n, phi_field, np.zeros((m, n)), top_seeds, left_seeds)
+    nodes = march_array(m, n, phi_field, eps_field, top_seeds, left_seeds)
 
     # plot the nodes if desired
     if plot:
         draw_linkages(nodes)
 
     # lift boundary (ghost four-bar)
-    boundary = lift_boundary_aligned(nodes, phi_field, corners, eps_b=0.0, project_to_edge=True)
+    boundary = lift_boundary_aligned(nodes, phi_field, corners, eps_b=eps_b, project_to_edge=True)
 
     if plot:
         plt.figure(figsize=(7, 7))
@@ -231,6 +224,8 @@ def inverse_rectangle(
         plt.axis("off")
         plt.title("Inverse to Rectangle (marching + boundary lift)")
         plt.show()
+
+    return nodes, boundary, corners
 
 
 # # ---------- example usage ----------
