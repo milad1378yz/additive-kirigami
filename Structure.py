@@ -438,7 +438,8 @@ class GenericStructure:
         linkage2quad_map = self.linkage2quad_map
         points = self.points
 
-        layout_points = np.empty_like(points)
+        # Start with NaNs so we can detect which nodes are already placed.
+        layout_points = np.full_like(points, np.nan)
 
         # layout top left linkage
         linkage_index = 0
@@ -470,11 +471,9 @@ class GenericStructure:
                     )
                     linkage_quads, linkage_points = self.layout_linkage(linkage_index, phi, 3)
 
-                linkage_points, shift_origin = self.translate_linkage(
-                    layout_points, linkage_points, linkage_quads
-                )
-                linkage_points = self.rotate_linkage(
-                    layout_points, linkage_points, linkage_quads, shift_origin
+                # Best-fit rigid alignment to all already-placed shared nodes
+                linkage_points = self.align_linkage_best_fit(
+                    layout_points, linkage_points, linkage_quads, quads
                 )
                 self.store_linkage_layout(
                     layout_points, linkage2quad_map, linkage_index, linkage_points, quads
@@ -498,6 +497,57 @@ class GenericStructure:
         return layout_points, mapped_hinge_contact_points
 
     @staticmethod
+    def align_linkage_best_fit(layout_points, linkage_points, linkage_quads, quads):
+        """
+        Align linkage_points to the current layout using a 2D best-fit rigid transform
+        (rotation + translation) computed over all shared nodes that have already
+        been placed in layout_points.
+
+        If only one shared node is available, performs a pure translation to match it.
+        """
+        # linkage_quads here is already the 4×4 array of quad node indices for this linkage.
+        linkage_node_inds = linkage_quads.flatten()
+
+        # Gather unique already-placed correspondences (source -> target)
+        seen = set()
+        src = []
+        dst = []
+        for k, node_index in enumerate(linkage_node_inds):
+            if node_index in seen:
+                continue
+            seen.add(node_index)
+            target = layout_points[node_index]
+            if not np.any(np.isnan(target)):
+                src.append(linkage_points[k])
+                dst.append(target)
+
+        if len(src) == 0:
+            # Nothing to align to (shouldn't happen except for the very first linkage)
+            return linkage_points
+
+        src = np.asarray(src, dtype=float)
+        dst = np.asarray(dst, dtype=float)
+
+        if len(src) == 1:
+            # Only one correspondence: translate
+            t = dst[0] - src[0]
+            return linkage_points + t
+
+        # Kabsch/SVD best-fit rigid transform in 2D
+        c_src = src.mean(axis=0)
+        c_dst = dst.mean(axis=0)
+        A = src - c_src
+        B = dst - c_dst
+        H = A.T @ B
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        t = c_dst - R @ c_src
+        return (R @ linkage_points.T).T + t
+
+    @staticmethod
     def rotate_linkage(layout_points, linkage_points, linkage_quads, shift_origin):
         rotation_origin = layout_points[linkage_quads[0, 1]]
         rotation_angle = -calculate_angle(shift_origin, rotation_origin, linkage_points[1])
@@ -515,7 +565,10 @@ class GenericStructure:
     def store_linkage_layout(layout_points, linkage2quad_map, linkage_index, linkage_points, quads):
         linkage_node_inds = quads[linkage2quad_map[linkage_index]].flatten()
         for k, node_index in enumerate(linkage_node_inds):
-            layout_points[node_index] = linkage_points[k]
+            # Only write nodes that haven't been placed yet to avoid undermining
+            # earlier alignments due to numerical noise.
+            if np.any(np.isnan(layout_points[node_index])):
+                layout_points[node_index] = linkage_points[k]
 
     # computes patterns for generic (non necessarily rigid-deployable) structures
     # if quad_gender -> CCW about hinge
@@ -1196,11 +1249,19 @@ class MatrixStructure(GenericStructure):
         Updates:
             self.points: Structure geometry achieving target boundary
 
-        Robust solver strategy (minimal I/O changes):
-            1) Build boundary system A @ X = B (with X = seed points)
-            2) Column-scale A and solve via truncated SVD (TSVD) for numerical rank
-            3) If needed, fall back to ridge-regularized normal equations
-            4) Final fallback: np.linalg.lstsq (SVD-based)
+        Process:
+            1. Extract boundary rows from design matrix
+            2. Form linear system: boundary_matrix @ seed_points = boundary_points
+            3. Solve for top and left seed points via matrix inverse
+            4. Build full structure with computed seed points
+
+        Mathematical approach:
+            - Reduces to linear system solving
+            - Guarantees exact boundary matching (if feasible)
+            - Enables target-driven design workflow
+
+        Shape transitions:
+            - Target boundary -> Computed seed points -> Full structure
         """
 
         num_linkage_cols = self.num_linkage_cols
@@ -1208,463 +1269,16 @@ class MatrixStructure(GenericStructure):
 
         design_matrix = self.calculate_design_matrix(interior_offsets, boundary_offsets)
 
-        # Gather boundary row indices
         bound_inds = []
         for bound_ind in range(4):
             bound_nodes = self.get_outer_boundary_node_inds(bound_ind)
             bound_inds.extend(bound_nodes)
 
-        # Subsystem: rows = boundary nodes; cols = top+left seed points
-        A = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
-        B = boundary_points
-        MAX_COND = 1e10
-        REG_COND = 1e6
-        BASE_RIDGE = 1e-6
+        sub_design_matrix = design_matrix[bound_inds, : (num_linkage_cols + num_linkage_rows)]
 
-        REL_SVD_TOL = 1e-12  # relative truncation threshold for SVD
-        ABS_SVD_FLOOR = 1e-15  # absolute floor to prevent divide-by-zero
-        RIDGE_SCHEDULE = [BASE_RIDGE, 10 * BASE_RIDGE, 100 * BASE_RIDGE, 1e-3, 1e-2]
-
-        # Try to estimate conditioning (may fail for rank-deficient A via cond())
-        try:
-            cond_est = np.linalg.cond(A)
-        except Exception:
-            cond_est = np.inf
-
-        # ---------- Preferred path: scaled TSVD solve ----------
-        def solve_tsvd(A, B):
-            # Column scaling improves SVD behavior on badly scaled problems
-            col_norms = np.linalg.norm(A, axis=0)
-            col_norms[col_norms == 0.0] = 1.0
-            As = A / col_norms
-
-            # Economy SVD
-            U, s, Vt = np.linalg.svd(As, full_matrices=False)
-            s_max = s[0] if s.size else 0.0
-
-            # Determine numerical rank (relative + absolute guard)
-            svd_tol = max(REL_SVD_TOL * s_max, ABS_SVD_FLOOR)
-            keep = s > svd_tol
-            r = int(np.count_nonzero(keep))
-
-            if r == 0:
-                # Completely degenerate after truncation
-                raise np.linalg.LinAlgError("TSVD found zero numerical rank.")
-
-            # Truncated SVD solve: X = V * diag(1/s) * U^T * B (only kept comps)
-            UtB = U[:, :r].T @ B  # (r, m) @ (m, d) -> (r, d)
-            Xs = Vt[:r, :].T @ (UtB / s[:r][:, None])  # (n, r) @ (r, d) -> (n, d)
-
-            # Undo column scaling
-            X = Xs / col_norms[:, None]
-
-            # Heuristic condition check using kept singulars
-            approx_cond = (s[0] / s[r - 1]) if r > 1 else 1.0
-            return X, r, approx_cond
-
-        # Attempt TSVD first if A is not obviously well-conditioned
-        try:
-            X, r_used, approx_cond = solve_tsvd(A, B)
-            # If the raw cond was OK, or truncated cond is acceptable, accept TSVD solution
-            if np.isfinite(cond_est) and cond_est < REG_COND:
-                pass  # TSVD is fine (usually close to direct solve but safer)
-            else:
-                if approx_cond > MAX_COND:
-                    # Too ill-conditioned even after truncation -> try ridge next
-                    raise np.linalg.LinAlgError("Truncated SVD still ill-conditioned.")
-        except Exception:
-            X = None
-
-        # ---------- Ridge-regularized normal equations fallback ----------
-        if X is None:
-            At = A.T
-            AtA = At @ A
-            AtB = At @ B
-            # Try a small schedule of lambda values (continuation)
-            solved = False
-            for lam in RIDGE_SCHEDULE:
-                try:
-                    X = np.linalg.solve(AtA + lam * np.eye(AtA.shape[0]), AtB)
-                    solved = True
-                    break
-                except np.linalg.LinAlgError:
-                    continue
-            if not solved:
-                X = None
-
-        # ---------- Final fallback: lstsq (SVD-based) ----------
-        if X is None:
-            X, *_ = np.linalg.lstsq(A, B, rcond=None)
-
-        # Split solution into top/left blocks (same as your original)
-        top_points = X[:num_linkage_cols, :]
-        left_points = X[num_linkage_cols : num_linkage_cols + num_linkage_rows, :]
-
-        # Build final structure
-        self.build_structure(top_points, left_points, corners, interior_offsets, boundary_offsets)
-
-
-# ------------------------------------------------------- DEPLOYED MATRIX ----------------------------------------------
-
-
-class DeployedMatrixStructure(GenericStructure):
-    """
-    A deployable kirigami structure using matrix-based design with deployment angles.
-
-    This class extends GenericStructure to provide matrix-based geometry generation
-    that incorporates deployment/folding angles. Unlike MatrixStructure which only
-    handles flat configurations, this class can generate deployed 3D configurations.
-
-    Key features:
-        - Matrix-based approach with deployment angle parameters
-        - 2D design matrix for full coordinate generation
-        - Support for uniform or spatially-varying deployment angles
-        - Inverse design capability for deployed configurations
-
-    Mathematical approach:
-        - Extended design matrix maps seed points to deployed coordinates
-        - Deployment angles (phi) control local folding at each linkage
-        - Each coordinate (x,y) handled separately in matrix formulation
-        - Rotation matrices embedded in design matrix construction
-
-    Applications:
-        - Simulating deployed kirigami structures
-        - Inverse design for target deployed shapes
-        - Analysis of deployment motion and constraints
-    """
-
-    def __init__(self, num_linkage_rows, num_linkage_cols):
-        """
-        Initialize a deployed matrix-based structure.
-
-        Args:
-            num_linkage_rows (int): Number of linkage rows in grid
-            num_linkage_cols (int): Number of linkage columns in grid
-
-        Inherits topology from GenericStructure and adds deployed geometry
-        generation capabilities with angle-dependent design matrices.
-        """
-        GenericStructure.__init__(self, num_linkage_rows, num_linkage_cols)
-
-    def calculate_design_matrix(self, offsets, boundary_offsets, phis, boundary_phis=None):
-        """
-        Calculate design matrix for deployed structure geometry generation.
-
-        Args:
-            offsets (ndarray): Interior offset parameters, shape (num_rows, num_cols)
-            boundary_offsets (list): Boundary offset parameters for each edge
-            phis (ndarray or float): Deployment angles in radians
-                                   If float: uniform angle for all linkages
-                                   If array: shape (num_rows, num_cols) for per-linkage angles
-            boundary_phis (ndarray, optional): Boundary deployment angles
-                                             If None, computed automatically from phis
-
-        Returns:
-            ndarray: Design matrix of shape (2*m, 2*n) where:
-                    2*m = total coordinates (x,y for each vertex)
-                    2*n = seed coordinate parameters (x,y for each seed point)
-
-        Design matrix structure:
-            - Handles x,y coordinates separately in 2D block structure
-            - Rotation matrices embedded based on deployment angles
-            - Each linkage contributes rotation-based relationships
-            - Boundary conditions handled with deployment constraints
-
-        Shape transitions:
-            - Input angles: scalar or (num_rows, num_cols)
-            - Output matrix: (2*total_vertices, 2*seed_points)
-            - Enables 2D coordinate generation from 2D seed points
-        """
-
-        num_linkage_rows = self.num_linkage_rows
-        num_linkage_cols = self.num_linkage_cols
-        assert offsets.shape[0] == num_linkage_rows
-        assert offsets.shape[1] == num_linkage_cols
-
-        if type(phis) is float:
-            print(
-                "calculate_design_matrix:\n    phis is float, building deployment arrays using that"
-            )
-            phi = phis
-            phis = np.zeros(offsets.shape)
-            for i in range(num_linkage_rows):
-                for j in range(num_linkage_cols):
-                    if self.is_horizontal_linkage(i=i, j=j):
-                        phis[i, j] = phi  # left angle
-                    else:
-                        phis[i, j] = np.pi - phi  # left angle
-
-            boundary_phis = np.array(
-                [
-                    [0.0] * num_linkage_rows,
-                    [0.0] * num_linkage_cols,
-                    [0.0] * num_linkage_rows,
-                    [0.0] * num_linkage_cols,
-                ],
-                dtype=object,
-            )
-            for bound_ind in range(4):
-                for z, (i, j) in enumerate(self.get_outer_boundary_linkages(bound_ind)):
-                    if self.is_horizontal_linkage(i, j):
-                        boundary_phis[bound_ind][z] = np.pi - phi
-                    else:
-                        boundary_phis[bound_ind][z] = phi
-
-        design_matrix = np.zeros(self.design_matrix_dims(), dtype=np.float64)
-
-        # SEED
-        for j in range(num_linkage_cols):
-            self.set_rows_identity(design_matrix, 2 * self.linkage2matrix(i=0, j=j, k=3), 2 * j)
-        for i in range(num_linkage_rows):
-            self.set_rows_identity(
-                design_matrix, 2 * self.linkage2matrix(i=i, j=0, k=0), 2 * (num_linkage_cols + i)
-            )
-
-        shift = num_linkage_cols + num_linkage_rows
-        self.set_rows_identity(design_matrix, 2 * self.linkage2matrix(i=0, j=-1, k=3), 2 * shift)
-        self.set_rows_identity(
-            design_matrix, 2 * self.linkage2matrix(i=num_linkage_rows, j=0, k=0), 2 * (shift + 1)
-        )
-        self.set_rows_identity(
-            design_matrix,
-            2 * self.linkage2matrix(i=num_linkage_rows - 1, j=num_linkage_cols, k=1),
-            2 * (shift + 2),
-        )
-        self.set_rows_identity(
-            design_matrix,
-            2 * self.linkage2matrix(i=-1, j=num_linkage_cols - 1, k=2),
-            2 * (shift + 3),
-        )
-
-        # BULK
-        for i in range(num_linkage_rows):
-            for j in range(num_linkage_cols):
-                phi = phis[i, j]
-                bottom_angle = phi - np.pi
-                right_angle = phi
-
-                row_ind_left, row_ind_bottom, row_ind_right, row_ind_top = [
-                    2 * self.linkage2matrix(i=i, j=j, k=k) for k in range(4)
-                ]
-
-                self.set_rows(
-                    design_matrix,
-                    offsets[i, j],
-                    row_ind_bottom,
-                    row_ind_left,
-                    row_ind_top,
-                    bottom_angle,
-                )
-                self.set_rows(
-                    design_matrix,
-                    offsets[i, j],
-                    row_ind_right,
-                    row_ind_top,
-                    row_ind_left,
-                    right_angle,
-                )
-
-        # BOUNDARY
-        for bound_ind in range(4):
-            for z, (i, j) in enumerate(self.get_outer_boundary_linkages(bound_ind)):
-
-                offset = boundary_offsets[bound_ind][z]
-                growth_k = (bound_ind + 1) % 4
-                existing_k = [(growth_k + 2) % 4, (growth_k + 1) % 4]
-
-                phi = boundary_phis[bound_ind][z]
-                if is_even(bound_ind):
-                    angle = phi
-                else:
-                    angle = np.pi - phi
-                growth_row_ind = 2 * self.linkage2matrix(i=i, j=j, k=growth_k)
-                last_last_row_ind = 2 * self.linkage2matrix(i=i, j=j, k=existing_k[0])
-                last_row_ind = 2 * self.linkage2matrix(i=i, j=j, k=existing_k[1])
-
-                self.set_rows(
-                    design_matrix, offset, growth_row_ind, last_row_ind, last_last_row_ind, angle
-                )
-
-        return design_matrix
-
-    @staticmethod
-    def set_rows(design_matrix, offset, row_ind_growth, row_ind_origin, row_ind_arm, angle):
-        """
-        Set matrix rows using rotation-based relationships for deployment.
-
-        Args:
-            design_matrix (ndarray): Design matrix to modify
-            offset (float): Growth offset parameter
-            row_ind_growth (int): Index for new point being positioned
-            row_ind_origin (int): Index for rotation origin point
-            row_ind_arm (int): Index for rotation arm point
-            angle (float): Rotation angle in radians
-
-        Operation:
-            Sets 2x2 block in design matrix encoding rotational relationship:
-            new_point = origin + (1 + offset) * rotation_matrix(angle) @ (arm - origin)
-
-        Purpose:
-            - Encodes kinematic relationships in deployed configuration
-            - Rotation matrices capture folding motion constraints
-            - Offset parameter allows local geometry variation
-
-        Shape: Modifies 2x2 block starting at (row_ind_growth, various_cols)
-        """
-
-        rot_mat = rotation_matrix(angle)
-        eye_mat = identity_matrix(2)
-
-        ori_mat = eye_mat - (1.0 + offset) * rot_mat
-        arm_mat = (1.0 + offset) * rot_mat
-
-        origin_rows = design_matrix[row_ind_origin : row_ind_origin + 2, :]
-        arm_rows = design_matrix[row_ind_arm : row_ind_arm + 2, :]
-
-        design_matrix[row_ind_growth : row_ind_growth + 2, :] = np.dot(
-            ori_mat, origin_rows
-        ) + np.dot(arm_mat, arm_rows)
-
-    @staticmethod
-    def set_rows_identity(design_matrix, row_ind, col_ind):
-        """
-        Set 2x2 identity block in design matrix for seed points.
-
-        Args:
-            design_matrix (ndarray): Design matrix to modify
-            row_ind (int): Starting row index for 2x2 block
-            col_ind (int): Starting column index for 2x2 block
-
-        Operation:
-            Sets identity block: [[1,0],[0,1]] at specified location
-
-        Purpose:
-            - Establishes direct mapping for seed coordinates
-            - Ensures seed points pass through unchanged
-            - Creates anchor points for matrix interpolation
-
-        Shape: Modifies 2x2 block at (row_ind:row_ind+2, col_ind:col_ind+2)
-        """
-        design_matrix[row_ind, col_ind] = 1.0  # x
-        design_matrix[row_ind + 1, col_ind + 1] = 1.0  # y
-
-    def design_matrix_dims(self):
-        """
-        Calculate dimensions of the deployed design matrix.
-
-        Returns:
-            tuple: (m, n) where:
-                  m = 2 * total_vertices (x,y coordinates for each vertex)
-                  n = 2 * seed_parameters (x,y coordinates for each seed point)
-
-        Size calculation:
-            - All dimensions doubled to handle (x,y) coordinate pairs
-            - Maintains same logical structure as MatrixStructure
-            - Enables full 2D coordinate generation
-
-        Shape: (2*total_vertices, 2*seed_parameters)
-        """
-
-        num_linkage_cols = self.num_linkage_cols
-        num_linkage_rows = self.num_linkage_rows
-
-        num_seed_points = num_linkage_cols + num_linkage_rows
-        num_bulk_points = 2 * num_linkage_rows * num_linkage_cols
-        num_boundary_points = 2 * (num_linkage_rows + num_linkage_cols + 2)
-
-        m = 2 * (num_seed_points + num_bulk_points + num_boundary_points)
-        n = 2 * (num_linkage_rows + num_linkage_cols + 4)
-
-        return m, n
-
-    def build_structure(
-        self, top_points, left_points, corners, offsets, boundary_offsets, phis, boundary_phis=None
-    ):
-        """
-        Build deployed structure geometry from seed points and angles.
-
-        Args:
-            top_points (ndarray): Top edge seed points, shape (num_cols, 2)
-            left_points (ndarray): Left edge seed points, shape (num_rows, 2)
-            corners (ndarray): Corner seed points, shape (4, 2)
-            offsets (ndarray): Interior offset parameters, shape (num_rows, num_cols)
-            boundary_offsets (list): Boundary offset parameters for each edge
-            phis (ndarray or float): Deployment angles
-            boundary_phis (ndarray, optional): Boundary deployment angles
-
-        Updates:
-            self.points: All vertex coordinates in deployed configuration
-
-        Process:
-            1. Calculate deployment-aware design matrix
-            2. Flatten seed points into coordinate vector [x1,y1,x2,y2,...]
-            3. Matrix multiply to get all deployed coordinates
-            4. Reshape result back to vertex array
-
-        Shape transitions:
-            - Seed points: (various, 2) -> Flattened coordinate vector
-            - Matrix multiplication -> Full coordinate vector
-            - Reshape -> (total_vertices, 2)
-        """
-        design_matrix = self.calculate_design_matrix(offsets, boundary_offsets, phis, boundary_phis)
-        seed_points = np.hstack(
-            (top_points.flatten("C"), left_points.flatten("C"), corners.flatten("C"))
-        )
-        points = np.dot(design_matrix, seed_points)
-        points = points.reshape(int(len(points) / 2), 2)
-        self.points = points
-
-    def linear_inverse_design(
-        self, boundary_points, corners, interior_offsets, boundary_offsets, phis, boundary_phis=None
-    ):
-        """
-        Inverse design for deployed configuration: find seed points for target boundary.
-
-        Args:
-            boundary_points (ndarray): Target boundary coordinates in deployed state
-            corners (ndarray): Fixed corner points, shape (4, 2)
-            interior_offsets (ndarray): Interior offset parameters
-            boundary_offsets (list): Boundary offset parameters
-            phis (ndarray or float): Deployment angles
-            boundary_phis (ndarray, optional): Boundary deployment angles
-
-        Updates:
-            self.points: Structure achieving target deployed boundary shape
-
-        Process:
-            1. Calculate deployed design matrix
-            2. Extract boundary equations from matrix
-            3. Solve linear system for top/left seed points
-            4. Build full deployed structure
-
-        Mathematical approach:
-            - Accounts for deployment angles in inverse problem
-            - Finds seed points that deploy to target boundary
-            - More complex than flat inverse design due to rotations
-
-        Shape transitions:
-            - Target deployed boundary -> Computed seed points -> Full deployed structure
-        """
-
-        num_linkage_cols = self.num_linkage_cols
-        num_linkage_rows = self.num_linkage_rows
-
-        design_matrix = self.calculate_design_matrix(
-            interior_offsets, boundary_offsets, phis, boundary_phis
-        )
-
-        bound_inds = []
-        for bound_ind in range(4):
-            bound_nodes = self.get_outer_boundary_node_inds(bound_ind)
-            for ind in bound_nodes:
-                bound_inds.append(2 * ind)
-                bound_inds.append(2 * ind + 1)
-
-        sub_design_matrix = design_matrix[bound_inds, : 2 * (num_linkage_cols + num_linkage_rows)]
-
-        # Robust solve with conditioning check; raise on extreme ill-conditioning
+        # Solve boundary system robustly and raise on extreme ill-conditioning
         A = sub_design_matrix
-        b = boundary_points.flatten("C")
+        B = boundary_points
         try:
             cond = np.linalg.cond(A)
         except Exception:
@@ -1672,48 +1286,24 @@ class DeployedMatrixStructure(GenericStructure):
 
         if not np.isfinite(cond) or cond > MAX_INVERSE_CONDITION_NUMBER:
             raise ValueError(
-                f"Inverse design boundary system (deployed) ill-conditioned (cond={cond:.2e}) "
+                f"Inverse design boundary system ill-conditioned (cond={cond:.2e}) "
                 f"for grid {num_linkage_rows}x{num_linkage_cols}."
             )
 
         try:
             if cond < REGULARIZE_COND_THRESHOLD:
-                inverted_seed_points = np.linalg.solve(A, b)
+                inverted_seed_points = np.linalg.solve(A, B)
             else:
                 AtA = A.T @ A
-                Atb = A.T @ b
+                AtB = A.T @ B
                 inverted_seed_points = np.linalg.solve(
-                    AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), Atb
+                    AtA + RIDGE_LAMBDA * np.eye(AtA.shape[0]), AtB
                 )
         except np.linalg.LinAlgError:
-            inverted_seed_points, *_ = np.linalg.lstsq(A, b, rcond=None)
-        top_points = inverted_seed_points[: 2 * num_linkage_cols].reshape(num_linkage_cols, 2)
+            inverted_seed_points, *_ = np.linalg.lstsq(A, B, rcond=None)
+        top_points = inverted_seed_points[:num_linkage_cols, :]
         left_points = inverted_seed_points[
-            2 * num_linkage_cols : 2 * (num_linkage_cols + num_linkage_rows)
-        ].reshape(num_linkage_rows, 2)
+            num_linkage_cols : num_linkage_cols + num_linkage_rows, :
+        ]
 
-        self.build_structure(
-            top_points,
-            left_points,
-            corners,
-            interior_offsets,
-            boundary_offsets,
-            phis,
-            boundary_phis,
-        )
-
-
-def main():
-    """
-    Main function for module reloading during development.
-
-    Returns:
-        None
-
-    Purpose:
-        - Provides feedback when Structure module is reloaded
-        - Useful for interactive development and debugging
-        - Indicates successful module import/reload
-    """
-    print("reloading Structure")
-    return
+        self.build_structure(top_points, left_points, corners, interior_offsets, boundary_offsets)
