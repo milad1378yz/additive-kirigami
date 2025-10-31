@@ -22,9 +22,7 @@ def checkerboard_phi(m, n, phi):
     return np.where(ij % 2 == 0, phi, np.pi - phi)
 
 
-def linspace2d(a, b, k):  # sample k points between 2D points a -> b (inclusive)
-    t = np.linspace(0.0, 1.0, k)
-    return (1 - t)[:, None] * a + t[:, None] * b
+ 
 
 
 # March the whole m×n array, *one negative space at a time* (forward DP)
@@ -179,77 +177,7 @@ def lift_boundary_aligned(nodes, phi_field, corners, *, eps_b=0.0, project_to_ed
 
 
 # ---------- boundary lift via ghost four-bar (Supplement §1.4) ----------
-def lift_boundary(nodes, phi_field, corners, eps_b=0.0):
-    """
-    Recover all outer boundary nodes {b_{i,0}, b_{i,n}, b_{0,j}, b_{m,j}}
-    using ghost 4-bar relations (same 2*2 formulas as interior), with ghost angles:
-        phi_{i,-1} = pi - phi_field[i,0]
-        phi_{-1,j} = pi - phi_field[0,j]
-        phi_{i,n}  = pi - phi_field[i,n-1]
-        phi_{m,j}  = pi - phi_field[m-1,j]
-    We step:
-      - Left  boundary downwards,   tying interior x_{i,0,0} to ghost x2
-      - Top   boundary rightwards,  tying interior x_{0,j,3} to ghost x1
-      - Right boundary downwards,   tying interior x_{i,n-1,2} to ghost x2 (mirror of left)
-      - Bottom boundary leftwards,  tying interior x_{m-1,j,1} to ghost x1 (mirror of top)
-    """
-    I = np.eye(2)
-    m, n = nodes.shape[:2]
-    TL, TR, BL, BR = corners["TL"], corners["TR"], corners["BL"], corners["BR"]
-
-    b_left = np.zeros((m + 1, 2), float)
-    b_left[0] = TL
-    b_top = np.zeros((n + 1, 2), float)
-    b_top[0] = TL
-    b_right = np.zeros((m + 1, 2), float)
-    b_right[0] = TR
-    b_bottom = np.zeros((n + 1, 2), float)
-    b_bottom[0] = BR  # will march leftwards and reverse at the end
-
-    # ---- Left boundary: b_{i+1,0} from (b_{i,0}, P = x_{i,0,0}) using x2 = -Q x0 + (I+Q) x3
-    for i in range(m):
-        phi_g = np.pi - phi_field[i, 0]
-        Q = (1.0 + eps_b) * R(-phi_g)
-        P = nodes[i, 0, 0]  # interior x_{i,0,0}
-        x3 = b_left[i]  # current boundary node
-        x0 = np.linalg.inv(Q) @ ((I + Q) @ x3 - P)  # solve for next boundary node
-        b_left[i + 1] = x0
-
-    # ---- Top boundary: b_{0,j+1} from (b_{0,j}, P = x_{0,j,3}) using x1 = (I - Q) x0 + Q x3
-    for j in range(n):
-        phi_g = np.pi - phi_field[0, j]
-        Q = (1.0 + eps_b) * R(-phi_g)
-        P = nodes[0, j, 3]  # interior x_{0,j,3}
-        x3 = b_top[j]
-        x0 = np.linalg.inv(I - Q) @ (P - Q @ x3)
-        b_top[j + 1] = x0
-
-    # ---- Right boundary: b_{i+1,n} from (b_{i,n}, P = x_{i,n-1,2}) using x2 = -Q x0 + (I+Q) x3
-    for i in range(m):
-        phi_g = np.pi - phi_field[i, n - 1]
-        Q = (1.0 + eps_b) * R(-phi_g)
-        P = nodes[i, n - 1, 2]  # interior x_{i,n-1,2}
-        x3 = b_right[i]
-        x0 = np.linalg.inv(Q) @ ((I + Q) @ x3 - P)
-        b_right[i + 1] = x0
-
-    # ---- Bottom boundary: march leftwards from BR to BL using P = x_{m-1,j,1}, then reverse
-    for j in range(n):
-        phi_g = np.pi - phi_field[m - 1, n - 1 - j]
-        Q = (1.0 + eps_b) * R(-phi_g)
-        P = nodes[m - 1, n - 1 - j, 1]  # interior x_{m-1,?,1}
-        x3 = b_bottom[j]  # current (right→left)
-        x0 = np.linalg.inv(I - Q) @ (P - Q @ x3)
-        b_bottom[j + 1] = x0
-    b_bottom = b_bottom[::-1]  # reorder: BL → BR
-
-    # Overwrite the four corners to match the exact rectangle corners
-    b_left[0], b_top[0] = TL, TL
-    b_top[-1], b_right[0] = TR, TR
-    b_right[-1], b_bottom[-1] = BR, BR
-    b_bottom[0], b_left[-1] = BL, BL
-
-    return dict(left=b_left, top=b_top, right=b_right, bottom=b_bottom)
+ 
 
 
 # ---------- tiny driver: inverse-to-rectangle via marching ----------
