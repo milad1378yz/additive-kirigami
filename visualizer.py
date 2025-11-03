@@ -122,4 +122,4 @@ def show_samples(
 
 if __name__ == "__main__":
     # Example usage (generates a gallery for manual inspection)
-    show_samples(n_samples=8, grid_rows=14, grid_cols=14, img_h=256, img_w=256, alpha=0.4, seed=1)
+    show_samples(n_samples=10, grid_rows=10, grid_cols=8, img_h=256, img_w=256, alpha=0.4, seed=12)

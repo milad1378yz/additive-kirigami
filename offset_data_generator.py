@@ -22,11 +22,9 @@ except Exception:
 # ----------------------------
 # Config (edit to taste)
 # ----------------------------
-GRID_ROWS = 18  # number of linkage rows  (height)
-GRID_COLS = 18  # number of linkage cols  (width)
+GRID_ROWS = 10  # number of linkage rows  (height)
+GRID_COLS = 10  # number of linkage cols  (width)
 IMG_H, IMG_W = 128, 128  # output image resolution
-N_TRAIN = 5000  # how many training samples to generate
-N_VALID = 1000  # how many validation samples to generate
 N_TRAIN = 10000  # how many training samples to generate
 N_VALID = 500  # how many validation samples to generate
 OUTPUT_PKL = "kirigami_dataset.pkl"
@@ -34,8 +32,8 @@ RANDOM_SEED = 42  # set to None for non-deterministic
 
 # sampling / epsilon-range hyperparameters
 USE_SOBOL = True  # do sobol sampling to cover better the space
-EPS_MIN = -0.6  # range of the epsilons should be in my hand (hyperparameters)
-EPS_MAX = 2.0  # (matches your original ~(-0.9, 9))
+EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
+EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
 EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
 NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
 
