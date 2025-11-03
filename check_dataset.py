@@ -7,8 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from Structure import MatrixStructure
-from Utils import plot_structure, find_invalid_quads
-from offset_data_generator import _compute_boundary_points_and_corners
+from Utils import plot_structure, find_invalid_quads, find_overlapping_quads
+from offset_data_generator import _compute_boundary_points_and_corners, _estimate_overlap_ratio, MAX_OVERLAP_RATIO
 
 
 def mask_extent_for_points(points, out_h, out_w):
@@ -168,9 +168,18 @@ def show_dataset_samples(
             img_h, img_w = msk2d.shape
             extent = mask_extent_for_points(pts, img_h, img_w)
             invalid_quads = find_invalid_quads(pts, structure.quads)
+            overlaps = find_overlapping_quads(pts, structure.quads)
+            ratio = _estimate_overlap_ratio(pts, structure.quads, msk2d, img_h, img_w)
 
             plot_structure(pts, structure.quads, linkages=None, ax=axO)
-            axO.set_title("Shape + Mask" + (" (invalid)" if invalid_quads else ""))
+            label = "Shape + Mask"
+            if invalid_quads:
+                label += " (invalid quads)"
+            if overlaps:
+                label += " (overlaps)"
+            if ratio > MAX_OVERLAP_RATIO:
+                label += f" (overlap {ratio*100:.1f}%)"
+            axO.set_title(label)
 
             # Darken outside the mask
             dark = np.zeros((img_h, img_w, 4), dtype=np.float32)

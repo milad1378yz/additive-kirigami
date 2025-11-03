@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from Structure import MatrixStructure
 
-from Utils import plot_structure, find_invalid_quads
+from Utils import plot_structure, find_invalid_quads, find_overlapping_quads
 from copy import deepcopy
 
 
@@ -36,6 +36,7 @@ EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
 EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
 EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
 NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
+MAX_OVERLAP_RATIO = 0.15  # reject samples with >15% area overlap between quads
 
 
 # ----------------------------
@@ -162,6 +163,45 @@ def _rasterize_quads_filled(points, quads, out_h=256, out_w=256):
     return mask
 
 
+def _estimate_overlap_ratio(points, quads, mask, out_h, out_w):
+    """
+    Approximate total overlap among quads as:
+      1 - (area of union) / (sum of individual quad areas)
+
+    - Uses the same normalization as the rasterizer for consistent scaling.
+    - Returns a value in [0, 1].
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    x, y = pts[:, 0], pts[:, 1]
+    xmin, xmax = x.min(), x.max()
+    ymin, ymax = y.min(), y.max()
+    sx = (out_w - 1) / (xmax - xmin) if xmax > xmin else 1.0
+    sy = (out_h - 1) / (ymax - ymin) if ymax > ymin else 1.0
+    s = min(sx, sy)
+
+    # Union area from mask (pixel area -> world area via 1/s^2)
+    union_pixels = float(mask.sum())
+    union_area = union_pixels / (s * s)
+
+    # Sum of quad areas in world units
+    areas = []
+    for q in quads:
+        poly = pts[np.asarray(q, dtype=int)]
+        a = 0.5 * abs(
+            sum(
+                poly[i, 0] * poly[(i + 1) % 4, 1] - poly[(i + 1) % 4, 0] * poly[i, 1]
+                for i in range(4)
+            )
+        )
+        areas.append(a)
+    sum_area = float(np.sum(areas))
+
+    if sum_area <= 1e-12:
+        return 1.0
+    ratio = max(0.0, min(1.0, 1.0 - union_area / sum_area))
+    return ratio
+
+
 def _make_one_sample(
     grid_rows,
     grid_cols,
@@ -233,10 +273,25 @@ def _make_one_sample(
         )
         return None
 
+    # Note: We intentionally do not do per-quad pair intersection filtering here
+    # because deployed shapes naturally self-overlap. Instead we rely on a global
+    # overlap-ratio threshold (above) that catches extreme/ill cases.
+
     # 7) rasterize (unchanged image) + NEW silhouette mask
     silhouette_mask = _rasterize_quads_filled(
         points_0, structure.quads, out_h=img_h, out_w=img_w
     )  # φ = 0
+
+    # Reject samples with excessive global overlap (approximate pixel-based test)
+    overlap_ratio = _estimate_overlap_ratio(
+        points_0, structure.quads, silhouette_mask, img_h, img_w
+    )
+    if overlap_ratio > MAX_OVERLAP_RATIO:
+        print(
+            f"[warn] Discarding sample due to overlap ratio {overlap_ratio:.2%} (> {MAX_OVERLAP_RATIO:.0%})",
+            flush=True,
+        )
+        return None
 
     # 8) add channel dimension, ensure float32
     image = interior_offsets.astype(np.float32)[None, :, :]

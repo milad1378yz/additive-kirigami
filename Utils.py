@@ -568,6 +568,120 @@ def find_invalid_quads(points, quads, area_tol=1e-8, tol=1e-9):
     return invalid
 
 
+def _quad_edges(quad):
+    """Return list of directed edge index pairs for a quad of 4 vertex indices."""
+    return [
+        (int(quad[0]), int(quad[1])),
+        (int(quad[1]), int(quad[2])),
+        (int(quad[2]), int(quad[3])),
+        (int(quad[3]), int(quad[0])),
+    ]
+
+
+def _aabb_for_poly(poly):
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return (x.min(), x.max(), y.min(), y.max())
+
+
+def _aabb_overlap(b1, b2, tol=0.0):
+    return not (
+        b1[1] < b2[0] - tol
+        or b2[1] < b1[0] - tol
+        or b1[3] < b2[2] - tol
+        or b2[3] < b1[2] - tol
+    )
+
+
+def _point_in_polygon(pt, poly, tol=1e-9):
+    """
+    Ray casting point-in-polygon. Returns True if inside or on boundary.
+    poly: (N,2) array; pt: (2,) array.
+    """
+    x, y = float(pt[0]), float(pt[1])
+    n = len(poly)
+    inside = False
+    for i in range(n):
+        j = (i - 1) % n
+        xi, yi = float(poly[i, 0]), float(poly[i, 1])
+        xj, yj = float(poly[j, 0]), float(poly[j, 1])
+
+        # On-edge check
+        if _point_on_segment(np.array([xj, yj]), np.array([x, y]), np.array([xi, yi]), tol):
+            return True
+
+        intersect = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi
+        )
+        if intersect:
+            inside = not inside
+    return inside
+
+
+def find_overlapping_quads(points, quads, tol=1e-9):
+    """
+    Detect overlaps between distinct quads (edge crossings or containment).
+
+    This catches cases where individual quads are valid (non-self-intersecting)
+    but different quads overlap each other, which can happen with large offsets.
+
+    Returns a list of (i, j, reason) with i<j.
+    """
+    pts = np.asarray(points, dtype=float)
+    qs = np.asarray(quads, dtype=int)
+    n = len(qs)
+
+    # Precompute per-quad data
+    polys = [pts[q] for q in qs]
+    bboxes = [_aabb_for_poly(poly) for poly in polys]
+    edges = [_quad_edges(q) for q in qs]
+
+    overlaps = []
+    for i in range(n):
+        qi = qs[i]
+        poly_i = polys[i]
+        box_i = bboxes[i]
+        edge_i = edges[i]
+        for j in range(i + 1, n):
+            qj = qs[j]
+            shared = set(qi.tolist()).intersection(set(qj.tolist()))
+            # Skip pairs that share an entire edge (adjacent quads)
+            if len(shared) >= 2:
+                continue
+
+            poly_j = polys[j]
+            box_j = bboxes[j]
+            if not _aabb_overlap(box_i, box_j, tol):
+                continue
+
+            # Edge-edge intersections (exclude edges that share endpoints)
+            hit = False
+            for a0, a1 in edge_i:
+                p0, p1 = pts[a0], pts[a1]
+                for b0, b1 in edges[j]:
+                    if a0 in shared or a1 in shared or b0 in shared or b1 in shared:
+                        # allow touching at shared vertices
+                        continue
+                    p2, p3 = pts[b0], pts[b1]
+                    if _segments_intersect2d(p0, p1, p2, p3, tol):
+                        overlaps.append((i, j, "edge crossing"))
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                continue
+
+            # Containment: one polygon entirely inside the other
+            # Pick a vertex not shared
+            vi = next((k for k in qi if k not in shared), qi[0])
+            vj = next((k for k in qj if k not in shared), qj[0])
+            if _point_in_polygon(pts[vi], poly_j, tol) or _point_in_polygon(pts[vj], poly_i, tol):
+                overlaps.append((i, j, "containment"))
+
+    return overlaps
+
+
 def write_obj(filename, points, quads):
     """
     Write geometry data to Wavefront OBJ file format.
