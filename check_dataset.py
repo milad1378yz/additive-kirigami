@@ -8,7 +8,11 @@ import matplotlib.pyplot as plt
 
 from Structure import MatrixStructure
 from Utils import plot_structure, find_invalid_quads, find_overlapping_quads
-from offset_data_generator import _compute_boundary_points_and_corners, _estimate_overlap_ratio, MAX_OVERLAP_RATIO
+from offset_data_generator import (
+    _compute_boundary_points_and_corners,
+    _estimate_overlap_ratio,
+    MAX_OVERLAP_RATIO,
+)
 
 
 def mask_extent_for_points(points, out_h, out_w):
@@ -209,7 +213,7 @@ def main():
         "--split", default="train", choices=["train", "valid"], help="Split to sample"
     )
     parser.add_argument("--n", type=int, default=6, help="Number of samples to display")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for sampling")
+    parser.add_argument("--seed", type=int, default=24, help="Random seed for sampling")
     parser.add_argument("--no-raw-mask", action="store_true", help="Hide raw mask column")
     parser.add_argument(
         "--save",

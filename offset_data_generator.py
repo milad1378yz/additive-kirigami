@@ -25,18 +25,23 @@ except Exception:
 GRID_ROWS = 10  # number of linkage rows  (height)
 GRID_COLS = 10  # number of linkage cols  (width)
 IMG_H, IMG_W = 128, 128  # output image resolution
-N_TRAIN = 10000  # how many training samples to generate
-N_VALID = 500  # how many validation samples to generate
+N_TRAIN = 100000  # how many training samples to generate
+N_VALID = 5000  # how many validation samples to generate
 OUTPUT_PKL = "kirigami_dataset.pkl"
 RANDOM_SEED = 42  # set to None for non-deterministic
 
 # sampling / epsilon-range hyperparameters
 USE_SOBOL = True  # do sobol sampling to cover better the space
-EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
+# Advanced sampling options (see docstrings below)
+SAMPLING_METHOD = "sobol"  # choices: "sobol", "sobol_base2", "lhs", "halton", "random"
+SOBOL_BURNIN = 0  # fast_forward N low-quality Sobol points (Owen 1997)
+LHS_OPTIMIZE = None  # examples: "random-cd" to reduce discrepancy (if SciPy supports)
+HALTON_LEAP = 0  # skip pattern for Halton
+EPS_MIN = -0.99  # range of the epsilons should be in my hand (hyperparameters)
 EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
 EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
 NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
-MAX_OVERLAP_RATIO = 0.15  # reject samples with >15% area overlap between quads
+MAX_OVERLAP_RATIO = 0.10  # reject samples with >10% area overlap between quads
 
 
 # ----------------------------
@@ -89,24 +94,80 @@ def _map_u_to_eps(
 
 # Sobol (quasi-random) block generator; falls back to uniform if SciPy missing or disabled
 def _make_u_batches(
-    n_samples: int, grid_rows: int, grid_cols: int, seed=None, use_sobol=True
+    n_samples: int,
+    grid_rows: int,
+    grid_cols: int,
+    seed=None,
+    use_sobol=True,
+    method: str = SAMPLING_METHOD,
+    sobol_burnin: int = SOBOL_BURNIN,
+    lhs_optimize=LHS_OPTIMIZE,
+    halton_leap: int = HALTON_LEAP,
 ) -> np.ndarray:
     """
-    Returns an array of shape (n_samples, grid_rows, grid_cols) with values in [0,1].
+    Return an array of shape (n_samples, grid_rows, grid_cols) with values in [0, 1].
+
+    Methods (literature-backed):
+    - "sobol" (default): Owen-scrambled Sobol sequence (Sobol 1967; Owen 1997) — strong
+      space-filling in high dimensions and good low-d projections.
+    - "sobol_base2": draw 2^m Sobol "nets" and slice to n_samples — improves net properties
+      when n_samples is not a power of two (Joe & Kuo 2008).
+    - "lhs": Latin Hypercube Sampling (McKay, Beckman, Conover 1979), optionally optimized to
+      reduce discrepancy (Morris & Mitchell 1995).
+    - "halton": Scrambled Halton sequence — good low-d projection properties (Kocis & Whiten 1997).
+    - "random": i.i.d. uniform baseline.
     """
     dim = grid_rows * grid_cols
-    if use_sobol and _HAVE_SCIPY:
-        # Scrambled Sobol for better space-filling; reproducible via seed
-        sampler = _qmc.Sobol(d=dim, scramble=True, seed=seed)
-        # We don't enforce power-of-two; .random(n) continues the sequence fine
-        u = sampler.random(n_samples)  # shape: (n_samples, dim)
-        u = u.reshape(n_samples, grid_rows, grid_cols)
-        return u
-    else:
-        if use_sobol and not _HAVE_SCIPY:
-            print("[WARN] SciPy not found; falling back to standard uniform sampling.")
+
+    # Helper: fall back to random when SciPy is missing for quasi-random samplers
+    def _fallback_random():
         rng = np.random.default_rng(seed)
-        return rng.random((n_samples, grid_rows, grid_cols))
+        return rng.random((n_samples, dim))
+
+    if method not in {"sobol", "sobol_base2", "lhs", "halton", "random"}:
+        method = "sobol" if use_sobol else "random"
+
+    if method == "random" or (not _HAVE_SCIPY and method != "random"):
+        if method != "random" and not _HAVE_SCIPY:
+            print(f"[WARN] SciPy not found; falling back to 'random' for method='{method}'.")
+        u = _fallback_random()
+    elif method == "sobol":
+        sampler = _qmc.Sobol(d=dim, scramble=True, seed=seed)
+        if sobol_burnin and sobol_burnin > 0:
+            sampler.fast_forward(sobol_burnin)
+        u = sampler.random(n_samples)
+    elif method == "sobol_base2":
+        sampler = _qmc.Sobol(d=dim, scramble=True, seed=seed)
+        if sobol_burnin and sobol_burnin > 0:
+            sampler.fast_forward(sobol_burnin)
+        # Generate the smallest 2^m >= n_samples for better net properties
+        m = int(np.ceil(np.log2(max(1, n_samples))))
+        u_full = sampler.random_base2(m)
+        # Shuffle deterministically before slicing to avoid bias from partial nets
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(u_full.shape[0])[:n_samples]
+        u = u_full[idx]
+    elif method == "lhs":
+        # Latin Hypercube (centered bins + optional discrepancy optimization)
+        try:
+            sampler = _qmc.LatinHypercube(
+                d=dim, centered=True, optimization=lhs_optimize, seed=seed
+            )
+        except TypeError:
+            # Older SciPy without 'optimization' kw
+            sampler = _qmc.LatinHypercube(d=dim, centered=True, seed=seed)
+        u = sampler.random(n_samples)
+    elif method == "halton":
+        # Halton with scrambling and optional leap
+        sampler = _qmc.Halton(d=dim, scramble=True, seed=seed)
+        if halton_leap and hasattr(sampler, "fast_forward"):
+            sampler.fast_forward(halton_leap)
+        u = sampler.random(n_samples)
+    else:
+        u = _fallback_random()
+
+    u = u.reshape(n_samples, grid_rows, grid_cols)
+    return u
 
 
 # NEW: silhouette rasterizer (φ = 0), fills the union of all quads (no cuts)
@@ -340,15 +401,37 @@ def build_dataset(
     eps_max=EPS_MAX,
     eps_scale=EPS_SCALE,
     use_sobol=USE_SOBOL,
+    sampling_method: str = SAMPLING_METHOD,
+    sobol_burnin: int = SOBOL_BURNIN,
+    lhs_optimize=LHS_OPTIMIZE,
+    halton_leap: int = HALTON_LEAP,
     num_workers=NUM_WORKERS,
 ):
     rng = np.random.default_rng(seed)
     ds = {"train": [], "valid": []}
 
     # Precompute quasi-random blocks for reproducibility & threading
-    u_train = _make_u_batches(n_train, grid_rows, grid_cols, seed=seed, use_sobol=use_sobol)
+    u_train = _make_u_batches(
+        n_train,
+        grid_rows,
+        grid_cols,
+        seed=seed,
+        use_sobol=use_sobol,
+        method=sampling_method,
+        sobol_burnin=sobol_burnin,
+        lhs_optimize=lhs_optimize,
+        halton_leap=halton_leap,
+    )
     u_valid = _make_u_batches(
-        n_valid, grid_rows, grid_cols, seed=None if seed is None else seed + 1, use_sobol=use_sobol
+        n_valid,
+        grid_rows,
+        grid_cols,
+        seed=None if seed is None else seed + 1,
+        use_sobol=use_sobol,
+        method=sampling_method,
+        sobol_burnin=sobol_burnin,
+        lhs_optimize=lhs_optimize,
+        halton_leap=halton_leap,
     )
 
     # Threaded generation for train
@@ -472,6 +555,10 @@ if __name__ == "__main__":
         eps_max=EPS_MAX,
         eps_scale=EPS_SCALE,
         use_sobol=USE_SOBOL,
+        sampling_method=SAMPLING_METHOD,
+        sobol_burnin=SOBOL_BURNIN,
+        lhs_optimize=LHS_OPTIMIZE,
+        halton_leap=HALTON_LEAP,
         num_workers=NUM_WORKERS,
     )
 
