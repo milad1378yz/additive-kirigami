@@ -270,18 +270,17 @@ fig, axs = plt.subplots(1, 2, figsize=(14, 6))
 
 # Overview with highlighted negative spaces
 plot_structure(deployed_points, structure.quads, structure.linkages, axs[0])
-axs[0].add_patch(
-    mpatches.Rectangle(
-        (annot_xlim[0], annot_ylim[0]),
-        annot_xlim[1] - annot_xlim[0],
-        annot_ylim[1] - annot_ylim[0],
-        linewidth=2,
-        edgecolor="tab:red",
-        facecolor="none",
-        zorder=6,
-    )
+zoom_rect = mpatches.Rectangle(
+    (annot_xlim[0], annot_ylim[0]),
+    annot_xlim[1] - annot_xlim[0],
+    annot_ylim[1] - annot_ylim[0],
+    linewidth=2,
+    edgecolor="tab:red",
+    facecolor="none",
+    zorder=6,
 )
-axs[0].set_title("Full pattern at mid deployment", color="k")
+axs[0].add_patch(zoom_rect)
+# axs[0].set_title("Full pattern at mid deployment", color="k")
 axs[0].axis("off")
 axs[0].set_aspect("equal")
 
@@ -290,14 +289,69 @@ plot_structure(deployed_points, structure.quads, structure.linkages, axs[1])
 axs[1].set_xlim(*annot_xlim)
 axs[1].set_ylim(*annot_ylim)
 
-for label, pt in zip(["x0", "x1", "x2", "x3"], node_pts):
+# Connect rectangle to zoomed view
+for corner in [(annot_xlim[1], annot_ylim[1]), (annot_xlim[1], annot_ylim[0])]:
+    target = (annot_xlim[0], corner[1])
+    con = mpatches.ConnectionPatch(
+        xyA=corner,
+        xyB=target,
+        coordsA="data",
+        coordsB="data",
+        axesA=axs[0],
+        axesB=axs[1],
+        linestyle="--",
+        linewidth=1.4,
+        color="tab:red",
+        alpha=0.9,
+        zorder=7,
+    )
+    con.set_clip_on(False)
+    fig.add_artist(con)
+
+for idx, pt in enumerate(node_pts):
     axs[1].scatter(pt[0], pt[1], color="dodgerblue", s=35, zorder=9)
-    axs[1].text(pt[0] + 0.08, pt[1] + 0.08, label, color="navy", fontsize=11, weight="bold")
+    direction = pt - hole_center_world
+    dist = np.linalg.norm(direction)
+    if dist < 1e-9:
+        direction = np.array([1.0, 0.0])
+        dist = 1.0
+    offset_len = 0.2 * dist + 0.03
+    offset_vec = direction / dist * offset_len
+
+    callibrator = np.array([-0.05, 0.05])
+    offset_vec += callibrator
+
+    text_pos = pt + offset_vec
+    ha = "left" if direction[0] >= 0 else "right"
+    va = "bottom" if direction[1] >= 0 else "top"
+    axs[1].text(
+        text_pos[0],
+        text_pos[1],
+        rf"$x_{{ij}}^{{{idx}}}$",
+        color="navy",
+        fontsize=16,
+        weight="bold",
+        ha=ha,
+        va=va,
+    )
 
 for label, qi in zip(["a", "b", "c", "d"], selected_quads):
     cx, cy = quad_centroids[qi]
+    centroid = np.array([cx, cy])
+    to_center = hole_center_world - centroid
+    dist = np.linalg.norm(to_center)
+    if dist > 1e-9:
+        to_center = to_center / dist
+    label_pos = centroid + to_center * (0.25 * dist)
     axs[1].text(
-        cx, cy, label, color="darkred", fontsize=13, weight="bold", ha="center", va="center"
+        label_pos[0],
+        label_pos[1],
+        rf"${label}_{{ij}}$",
+        color="darkred",
+        fontsize=16,
+        weight="bold",
+        ha="center",
+        va="center",
     )
 
 phi_origin = node_pts[0]
@@ -325,18 +379,18 @@ axs[1].add_patch(
     )
 )
 mid_angle = np.deg2rad(theta_start + arc_span / 2.0)
-phi_label_pos = phi_origin + 0.85 * phi_radius * np.array([np.cos(mid_angle), np.sin(mid_angle)])
+phi_label_pos = phi_origin + 0.65 * phi_radius * np.array([np.cos(mid_angle), np.sin(mid_angle)])
 axs[1].text(
     phi_label_pos[0],
     phi_label_pos[1],
-    r"$\phi$",
+    r"$\phi_{ij}$",
     color="k",
-    fontsize=12,
+    fontsize=16,
     weight="bold",
     zorder=10,
 )
 
-axs[1].set_title("Annotated negative space (a,b,c,d + nodes)", color="k")
+# axs[1].set_title("Annotated negative space (a,b,c,d + nodes)", color="k")
 axs[1].axis("off")
 axs[1].set_aspect("equal")
 
