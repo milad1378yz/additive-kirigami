@@ -5,8 +5,7 @@ from tqdm import tqdm
 
 from Structure import MatrixStructure
 
-from Utils import plot_structure, find_invalid_quads, find_overlapping_quads
-from copy import deepcopy
+from Utils import find_invalid_quads
 
 
 from concurrent.futures import ThreadPoolExecutor
