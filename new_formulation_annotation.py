@@ -200,6 +200,7 @@ deployed_points[:, 1] = (
     deployed_points[:, 1] - (np.max(deployed_points[:, 1]) + np.min(deployed_points[:, 1])) / 2
 )
 
+
 mask_res = 600
 filled_mask, _, scale, xmin, xmax, ymin, ymax = rasterize_quads(
     deployed_points, structure.quads, out_h=mask_res, out_w=mask_res
