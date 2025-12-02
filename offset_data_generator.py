@@ -24,9 +24,9 @@ except Exception:
 GRID_ROWS = 10  # number of linkage rows  (height)
 GRID_COLS = 10  # number of linkage cols  (width)
 IMG_H, IMG_W = 128, 128  # output image resolution
-N_TRAIN = 100000  # how many training samples to generate
-N_VALID = 5000  # how many validation samples to generate
-OUTPUT_PKL = "kirigami_dataset.pkl"
+N_TRAIN = 10000  # how many training samples to generate
+N_VALID = 100  # how many validation samples to generate
+OUTPUT_PKL = "kirigami_dataset3.pkl"
 RANDOM_SEED = 42  # set to None for non-deterministic
 
 # sampling / epsilon-range hyperparameters
@@ -36,11 +36,11 @@ SAMPLING_METHOD = "sobol"  # choices: "sobol", "sobol_base2", "lhs", "halton", "
 SOBOL_BURNIN = 0  # fast_forward N low-quality Sobol points (Owen 1997)
 LHS_OPTIMIZE = None  # examples: "random-cd" to reduce discrepancy (if SciPy supports)
 HALTON_LEAP = 0  # skip pattern for Halton
-EPS_MIN = -0.99  # range of the epsilons should be in my hand (hyperparameters)
-EPS_MAX = 9.0  # (matches your original ~(-0.9, 9))
+EPS_MIN = -0.9  # range of the epsilons should be in my hand (hyperparameters)
+EPS_MAX = 2  # (matches your original ~(-0.9, 9))
 EPS_SCALE = "log"  # "log" to preserve your 10^x - 1 shape; use "linear" for uniform range
-NUM_WORKERS = 20  # do multi threading for the loop of generation (None -> let Python decide)
-MAX_OVERLAP_RATIO = 0.10  # reject samples with >10% area overlap between quads
+NUM_WORKERS = 40  # do multi threading for the loop of generation (None -> let Python decide)
+MAX_OVERLAP_RATIO = 0.02  # reject samples with >10% area overlap between quads
 
 
 # ----------------------------
@@ -85,7 +85,7 @@ def _map_u_to_eps(
             raise ValueError("For EPS_SCALE='log', require EPS_MIN > -1 so that (eps+1) > 0.")
         a = np.log10(lo)
         b = np.log10(hi)
-        return np.power(10.0, a + (b - a) * u01) - 1.0
+        return np.power(10.0, a + (b - a) * u01) - 1.0  # the data is between
     else:
         # linear
         return eps_min + (eps_max - eps_min) * u01
@@ -308,9 +308,18 @@ def _make_one_sample(
     boundary_offsets = [[0.0] * grid_rows, [0.0] * grid_cols, [0.0] * grid_rows, [0.0] * grid_cols]
 
     # 5) inverse design + bookkeeping (exactly as your code does)
-    structure.linear_inverse_design(
-        np.vstack(boundary_points), corners, interior_offsets, boundary_offsets
-    )
+    try:
+        structure.linear_inverse_design(
+            np.vstack(boundary_points), corners, interior_offsets, boundary_offsets
+        )
+    except ValueError as exc:
+        # Skip samples where the inverse design system is numerically unstable
+        if "ill-conditioned" in str(exc).lower():
+            print(
+                f"[warn] Discarding sample due to ill-conditioned inverse design: {exc}", flush=True
+            )
+            return None
+        raise
     structure.assign_node_layers()
     structure.assign_quad_genders()
     structure.make_hinge_contact_points()
