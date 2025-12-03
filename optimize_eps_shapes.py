@@ -1,10 +1,14 @@
 import time
+import os
 import numpy as np
 import scipy.optimize as scopt
 from numpy.linalg import norm
+import matplotlib.pyplot as plt
 
 from Structure import MatrixStructure
 from offset_data_generator import _rasterize_quads_filled
+import imageio.v2 as imageio
+from Utils import plot_structure
 
 
 def _build_structure_context(width: int, height: int):
@@ -214,7 +218,7 @@ def main():
         "circle": lambda theta: np.ones_like(theta, dtype=np.float64),
         "hexagon": lambda theta: _regular_polygon_radius(theta, 6),
         "heart": heart_radial_fn,
-        "star": lambda theta: np.maximum(0.35, 1.0 + 0.45 * np.cos(5 * theta)),
+        "star": lambda theta: np.maximum(0.6, 1.0 + 0.25 * np.cos(5 * theta)),
         "clover": lambda theta: np.maximum(0.4, 1.0 + 0.25 * np.cos(3 * theta)),
     }
 
@@ -241,6 +245,15 @@ def main():
         save_kwargs[f"{name}_cost"] = res["cost"]
 
     np.savez_compressed("optimized_eps_shapes.npz", **save_kwargs)
+
+    # Save per-shape masks (visual and raw)
+    os.makedirs("optimized_masks", exist_ok=True)
+    for name, res in results.items():
+        mask = res["mask"]
+        np.save(os.path.join("optimized_masks", f"{name}_mask.npy"), mask)
+        imageio.imwrite(
+            os.path.join("optimized_masks", f"{name}_mask.png"), (mask * 255).astype(np.uint8)
+        )
 
     print("Saved optimized eps and masks ➜ optimized_eps_shapes.npz")
     for name, res in results.items():

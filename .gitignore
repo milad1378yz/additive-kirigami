@@ -11,3 +11,4 @@ demo_*.py
 
 *temp*
 *.npz
+*.npy
