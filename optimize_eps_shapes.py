@@ -162,7 +162,43 @@ def _compute_layout_and_mask(context, interior_offsets: np.ndarray, mask_size: i
     points_0, _ = structure.layout(phi=0.0)
     points_0 = _center_points(points_0)
     mask = _rasterize_quads_filled(points_0, structure.quads, out_h=mask_size, out_w=mask_size)
-    return points_0, mask
+    return points_0, mask, structure
+
+
+def _mask_extent_for_points(points, out_h, out_w):
+    x = points[:, 0]
+    y = points[:, 1]
+    xmin, xmax = x.min(), x.max()
+    ymin, ymax = y.min(), y.max()
+    sx = (out_w - 1) / (xmax - xmin) if xmax > xmin else 1.0
+    sy = (out_h - 1) / (ymax - ymin) if ymax > ymin else 1.0
+    s = min(sx, sy)
+    return [xmin, xmin + out_w / s, ymax - out_h / s, ymax]
+
+
+def _save_overlay(name, points, mask, structure, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    img_h, img_w = mask.shape
+    extent = _mask_extent_for_points(points, img_h, img_w)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    plot_structure(points, structure.quads, linkages=None, ax=ax)
+
+    dark = np.zeros((img_h, img_w, 4), dtype=np.float32)
+    dark[..., :3] = 0.0
+    dark[..., 3] = (1.0 - mask) * 0.6
+    ax.imshow(dark, extent=extent, origin="upper", zorder=5)
+
+    overlay = np.zeros((img_h, img_w, 4), dtype=np.float32)
+    overlay[..., 1] = 1.0
+    overlay[..., 3] = mask * 0.35
+    ax.imshow(overlay, extent=extent, origin="upper", zorder=6)
+
+    ax.set_title(f"{name} – deformed mask overlay")
+    ax.axis("off")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"{name}_overlay.png"), dpi=200)
+    plt.close(fig)
 
 
 def optimize_shape(
@@ -194,7 +230,7 @@ def optimize_shape(
     )
     duration = time.time() - start
     eps_matrix = np.reshape(result.x, (height, width)).astype(np.float32)
-    _, mask = _compute_layout_and_mask(context, eps_matrix, mask_size)
+    points, mask, _ = _compute_layout_and_mask(context, eps_matrix, mask_size)
     return {
         "eps": eps_matrix,
         "mask": mask.astype(np.float32),
@@ -202,6 +238,8 @@ def optimize_shape(
         "time_sec": duration,
         "status": result.status,
         "message": result.message,
+        "points": points,
+        "structure": context["structure"],
     }
 
 
@@ -254,6 +292,7 @@ def main():
         imageio.imwrite(
             os.path.join("optimized_masks", f"{name}_mask.png"), (mask * 255).astype(np.uint8)
         )
+        _save_overlay(name, res["points"], mask, res["structure"], "optimized_masks")
 
     print("Saved optimized eps and masks ➜ optimized_eps_shapes.npz")
     for name, res in results.items():
